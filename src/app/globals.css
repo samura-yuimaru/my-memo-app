@@ -82,16 +82,31 @@
 html,
 body {
   height: 100%;
+  /* iPadでのアドレスバー引っ張り更新(ラバーバンド)を抑止し、PWA(standalone)
+     起動時にネイティブアプリらしい挙動にする。内部のスクロール領域は
+     個別に overscroll-contain 済みなのでこの指定と競合しない */
+  overscroll-behavior: none;
 }
 
 body {
   font-family: var(--font-sans);
   background-color: rgb(var(--surface));
   color: rgb(var(--ink-900));
+  /* iOS/iPadでのタップ後の遅延(300msダブルタップズーム判定)を無くし、
+     タップ応答を速くする。ピンチズーム自体はviewportのuser-scalable=noで抑止済み */
+  touch-action: manipulation;
+  /* Safariが長押しなどでテキストサイズを勝手に調整するのを防ぐ */
+  -webkit-text-size-adjust: 100%;
 }
 
 * {
   -webkit-tap-highlight-color: transparent;
+}
+
+button,
+[role="button"],
+a {
+  touch-action: manipulation;
 }
 
 textarea {
