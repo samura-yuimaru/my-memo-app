@@ -1,16 +1,39 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Download, Loader2, RefreshCw, Upload } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, Download, HardDrive, Loader2, RefreshCw, Upload } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { Popover } from "@/components/ui/Popover";
 
+/** 「○分前」/ 今日の時刻(HH:mm:ss)で最終同期時刻を表す */
+function formatLastSynced(iso: string): string {
+  const diffMin = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (diffMin < 1) return "たった今";
+  if (diffMin < 60) return `${diffMin}分前`;
+  return new Date(iso).toLocaleTimeString("ja-JP", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 /**
  * 画面隅に常駐する「データ保護ステータス」の☑マーク。タップすると、最終同期時刻の確認と
  * JSONでの書き出し/読み込み(バックアップ・機種変更時の引き継ぎ)ができるパネルを開く。
- * 色でひと目に状態がわかるようにしている:
- *   緑チェック = 保護済み(保存/同期済み) / 青回転 = 同期中 / 黄色 = オフライン(端末には保存済み) / 赤 = エラー
+ *
+ * 表示状態は、次のすべてが一致してはじめて「クラウド同期済み」を名乗る:
+ *   1) Supabaseが設定されている(supabaseReady)
+ *   2) 匿名認証セッションが確立している(userId が非null = isAnonymousなユーザーとして認証済み)
+ *   3) オンラインである(isOnline)
+ *   4) 実際に書き込みが完了している(syncStatusが"saving"/"error"ではなく、
+ *      ローカルの未送信キューが0件 = pendingCount === 0)
+ * これらのどれか一つでも欠けている間は、絶対に緑の「クラウド同期済み」を名乗らない
+ * (以前は supabaseReady と userId の状態を見ずに緑チェックを出してしまい、
+ *  「緑なのに端末保存のみ/未同期」という表示の不整合が起きていたための修正)。
+ *
+ * 色: 緑=クラウド同期済み / 青回転=同期中・接続中 / 黄=オフライン / 赤=同期エラー /
+ *     グレー=Supabase未設定(端末のみ、クラウド同期の対象外)
  */
 export function AutosaveIndicator() {
   const syncStatus = useOutlineStore((s) => s.syncStatus);
@@ -20,6 +43,8 @@ export function AutosaveIndicator() {
   const reconnecting = useOutlineStore((s) => s.reconnecting);
   const reconnectSupabase = useOutlineStore((s) => s.reconnectSupabase);
   const lastSyncedAt = useOutlineStore((s) => s.lastSyncedAt);
+  const pendingCount = useOutlineStore((s) => s.pendingCount);
+  const refreshPendingCount = useOutlineStore((s) => s.refreshPendingCount);
   const exportSnapshot = useOutlineStore((s) => s.exportSnapshot);
   const importSnapshot = useOutlineStore((s) => s.importSnapshot);
 
@@ -29,9 +54,18 @@ export function AutosaveIndicator() {
   const [reconnectMessage, setReconnectMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ローカルの未送信キュー件数は他タブでの操作等でも変わり得るため、パネルを開いている間・
+  // マウント中は定期的に数え直して実態と表示がずれないようにする
+  useEffect(() => {
+    void refreshPendingCount();
+    const timer = window.setInterval(() => void refreshPendingCount(), 4000);
+    return () => window.clearInterval(timer);
+  }, [refreshPendingCount]);
+
+  const connected = supabaseReady && !!userId;
   // Supabase自体は設定済みなのに、匿名認証がまだ通っていない(またはエラー状態)の場合に、
   // ワンタップで再接続できるボタンをモーダル内に出す
-  const showReconnect = supabaseReady && (syncStatus === "error" || !userId);
+  const showReconnect = supabaseReady && !reconnecting && (syncStatus === "error" || !userId);
 
   const view = (() => {
     if (syncStatus === "saving") {
@@ -52,10 +86,10 @@ export function AutosaveIndicator() {
     }
     if (!supabaseReady) {
       return {
-        icon: <CheckCircle2 size={16} />,
-        label: "端末に保護済み(ローカル)",
-        detail: "Supabase未接続のため、この端末のみに自動保存されています",
-        className: "text-emerald-600 dark:text-emerald-300",
+        icon: <HardDrive size={16} />,
+        label: "端末のみに保存(ローカル専用)",
+        detail: "Supabase未設定のため、この端末のみに自動保存されています",
+        className: "text-ink-500",
       };
     }
     if (!isOnline) {
@@ -66,24 +100,32 @@ export function AutosaveIndicator() {
         className: "text-amber-500 dark:text-amber-300",
       };
     }
+    if (!userId || reconnecting) {
+      return {
+        icon: <Loader2 size={16} className="animate-spin" />,
+        label: "Supabaseに接続中…",
+        detail: "匿名認証セッションを確立しています",
+        className: "text-sky-600 dark:text-sky-300",
+      };
+    }
+    if (pendingCount > 0) {
+      return {
+        icon: <Loader2 size={16} className="animate-spin" />,
+        label: "同期中…",
+        detail: `クラウドへの送信待ちが${pendingCount}件あります`,
+        className: "text-sky-600 dark:text-sky-300",
+      };
+    }
     return {
       icon: <CheckCircle2 size={16} />,
-      label: "保護されています",
-      detail: "端末とクラウドの両方に自動保存・同期済みです",
+      label: "クラウド同期済み(Supabase)",
+      detail: "端末とSupabaseの両方に自動保存・同期済みです",
       className: "text-emerald-600 dark:text-emerald-300",
     };
   })();
 
-  const lastSyncedLabel = lastSyncedAt
-    ? new Date(lastSyncedAt).toLocaleString("ja-JP", {
-        year: "numeric",
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      })
-    : "まだ同期していません";
+  const lastSyncedLabel =
+    connected && lastSyncedAt ? formatLastSynced(lastSyncedAt) : "まだ同期していません";
 
   async function handleExport() {
     const snapshot = await exportSnapshot();

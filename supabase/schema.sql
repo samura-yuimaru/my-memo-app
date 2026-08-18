@@ -116,6 +116,40 @@ create policy "nodes_owner_all" on public.nodes
   with check (auth.uid() = user_id);
 
 -- ------------------------------------------------------------
+-- セキュリティ強化: anonキーだけでの無制限アクセスを遮断する
+-- ------------------------------------------------------------
+-- Supabaseはpublicスキーマの新規テーブルに対して、デフォルトでanon/authenticatedの
+-- 両ロールへテーブルレベルのSELECT/INSERT/UPDATE/DELETE権限を自動付与する。
+-- RLSが有効な限りauth.uid() = user_idで行単位には保護されるが、「anonキーのみ(未認証の
+-- 生リクエスト)で無制限アクセスできてしまう」設計ミスを完全に防ぐため、
+-- 未認証のanonロールからはテーブル権限そのものを剥奪し、匿名認証済み
+-- (=authenticatedロール、is_anonymous=trueのユーザーを含む)のみに権限を絞る。
+-- こうすることで、認証セッションなしの生のanon key呼び出しはRLS以前にDB権限の時点で
+-- 全操作が拒否されるようになる(多層防御)。
+revoke all on public.folders from anon;
+revoke all on public.notes from anon;
+revoke all on public.nodes from anon;
+
+grant select, insert, update, delete on public.folders to authenticated;
+grant select, insert, update, delete on public.notes to authenticated;
+grant select, insert, update, delete on public.nodes to authenticated;
+
+-- Studioのテーブル作成ウィザード等で作られがちな「全員に許可」系テンプレートポリシーが
+-- もし存在していた場合に備えて、念のため代表的な名前を明示的に削除しておく(存在しなければ無害)。
+drop policy if exists "Enable read access for all users" on public.folders;
+drop policy if exists "Enable insert for authenticated users only" on public.folders;
+drop policy if exists "Enable update for users based on user_id" on public.folders;
+drop policy if exists "Enable delete for users based on user_id" on public.folders;
+drop policy if exists "Enable read access for all users" on public.notes;
+drop policy if exists "Enable insert for authenticated users only" on public.notes;
+drop policy if exists "Enable update for users based on user_id" on public.notes;
+drop policy if exists "Enable delete for users based on user_id" on public.notes;
+drop policy if exists "Enable read access for all users" on public.nodes;
+drop policy if exists "Enable insert for authenticated users only" on public.nodes;
+drop policy if exists "Enable update for users based on user_id" on public.nodes;
+drop policy if exists "Enable delete for users based on user_id" on public.nodes;
+
+-- ------------------------------------------------------------
 -- Realtime: 変更をクライアントへリアルタイム配信(複数端末の自動同期)
 -- ------------------------------------------------------------
 alter publication supabase_realtime add table public.folders;
@@ -127,4 +161,8 @@ alter publication supabase_realtime add table public.nodes;
 -- Authentication > Providers > Anonymous Sign-ins を有効化してください。
 -- これによりログイン画面なしで各ブラウザに匿名ユーザーが自動発行され、
 -- 上記RLSポリシーでそのユーザーのデータのみが保護されます。
+--
+-- このファイルは何度でも安全に再実行できます(create/drop if existsで冪等)。
+-- セキュリティ強化セクションを追加した場合は、既存プロジェクトでも
+-- SQL Editorで再実行して権限を反映してください。
 -- ============================================================

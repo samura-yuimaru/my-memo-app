@@ -97,10 +97,12 @@ export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function
     s.focusRequest?.id === node.id ? s.focusRequest : null
   );
 
-  // マウント時に一度だけ初期HTMLを流し込む(以降はReactの再描画で書き換えない)
+  // マウント時に一度だけ初期HTMLを流し込む(以降はReactの再描画で書き換えない)。
+  // JSONインポートや将来の機能追加などで未サニタイズのHTMLが紛れ込んでいても
+  // DOMへ書き込む直前に必ずsanitizeHtmlを通す(多層防御)
   useEffect(() => {
     const el = editorRef.current;
-    if (el) el.innerHTML = node.content;
+    if (el) el.innerHTML = sanitizeHtml(node.content);
     lastSyncedHistoryVersionRef.current = historyVersion;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -117,7 +119,7 @@ export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function
     if (node.content === lastKnownContentRef.current && !forced) return;
     lastKnownContentRef.current = node.content;
     if (isFocusedRef.current && !forced) return;
-    el.innerHTML = node.content;
+    el.innerHTML = sanitizeHtml(node.content);
     if (forced && isFocusedRef.current) {
       setCaretOffset(el, htmlToPlainText(el.innerHTML).length);
     }

@@ -1,4 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
+import { devError } from "@/lib/utils/log";
 import { getSupabaseClient } from "./client";
 
 function sleep(ms: number): Promise<void> {
@@ -28,7 +29,7 @@ export async function ensureAnonymousSession(retries = 3): Promise<Session | nul
     lastErrorMessage = error?.message ?? lastErrorMessage;
     if (attempt < retries - 1) await sleep(500 * 2 ** attempt); // 500ms → 1000ms → 2000ms…
   }
-  console.error("[supabase] 匿名サインインに失敗しました:", lastErrorMessage);
+  devError("[supabase] 匿名サインインに失敗しました:", lastErrorMessage);
   return null;
 }
 

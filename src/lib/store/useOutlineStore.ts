@@ -16,7 +16,8 @@ import type {
 } from "@/types/outline";
 import { generateId } from "@/lib/utils/id";
 import { nowIso } from "@/lib/utils/date";
-import { escapeHtml, htmlToPlainText, splitHtmlAtOffset } from "@/lib/utils/richText";
+import { devError } from "@/lib/utils/log";
+import { escapeHtml, htmlToPlainText, sanitizeHtml, splitHtmlAtOffset } from "@/lib/utils/richText";
 import {
   buildTree,
   flattenVisible,
@@ -86,6 +87,8 @@ interface OutlineState {
   lastSyncedAt: string | null;
   /** Supabaseへの(再)接続処理が進行中かどうか。手動再接続ボタンの二重押下防止・スピナー表示に使う */
   reconnecting: boolean;
+  /** Supabaseへまだ送信できていないローカルの変更・削除の件数(IndexedDBのdirty/pendingDeletesの合計) */
+  pendingCount: number;
 
   folders: FolderData[];
   notesList: NoteData[];
@@ -172,6 +175,8 @@ interface OutlineState {
    * 開いているメモの再購読までまとめて行う。
    */
   reconnectSupabase: () => Promise<boolean>;
+  /** 未送信の変更・削除件数(pendingCount)を再計算する。データ保護ステータスの表示更新に使う */
+  refreshPendingCount: () => Promise<void>;
 }
 
 function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): OutlineNodeData {
@@ -215,6 +220,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   syncStatus: "idle",
   lastSyncedAt: null,
   reconnecting: false,
+  pendingCount: 0,
 
   folders: [],
   notesList: [],
@@ -251,8 +257,25 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       });
     }
 
+    const client = getSupabaseClient();
+    if (client) {
+      // セッションが失効(トークンリフレッシュ失敗・サインアウト等)した場合に自動で
+      // 再認証を試みる、安全な再接続フロー。SupabaseのSDKがトークン更新も自動で
+      // 行うが(autoRefreshToken)、それでも失われた場合の最終防御線としてここで検知する。
+      client.auth.onAuthStateChange((event, session) => {
+        if (event === "SIGNED_OUT") {
+          useOutlineStore.setState({ userId: null });
+          void connectSupabase();
+          return;
+        }
+        if (event === "TOKEN_REFRESHED" || event === "SIGNED_IN" || event === "USER_UPDATED") {
+          useOutlineStore.setState({ userId: session?.user.id ?? null });
+        }
+      });
+    }
+
     // 起動時: 匿名サインイン(リトライ付き)→ 成功したら即座に未送信分の同期キューを処理する
-    if (getSupabaseClient()) await connectSupabase();
+    if (client) await connectSupabase();
 
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
     await flushPendingSync();
@@ -268,7 +291,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
     const { data, error } = await client.from("folders").select("*").eq("user_id", userId);
     if (error) {
-      console.error("[sync] フォルダ一覧の取得に失敗しました:", error.message);
+      devError("[sync] フォルダ一覧の取得に失敗しました:", error.message);
       return;
     }
     const remoteFolders = (data ?? []).map(folderFromRow);
@@ -290,7 +313,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       .select("*")
       .eq("user_id", userId);
     if (error) {
-      console.error("[sync] メモ一覧の取得に失敗しました:", error.message);
+      devError("[sync] メモ一覧の取得に失敗しました:", error.message);
       return;
     }
     const remoteNotes = (data ?? []).map(noteFromRow);
@@ -333,7 +356,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
           set({ nodes: toMap(merged) });
         }
       } else if (error) {
-        console.error("[sync] ノードの取得に失敗しました:", error.message);
+        devError("[sync] ノードの取得に失敗しました:", error.message);
       }
       // 購読を貼る直前でも、その間に別のメモへ遷移していないか再確認する
       // (遅いレスポンスが新しいメモの購読を横取りしないようにするため)
@@ -1028,6 +1051,10 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     return ok;
   },
 
+  refreshPendingCount: async () => {
+    await refreshPendingCount();
+  },
+
   exportSnapshot: async () => {
     const [folders, notes, nodes] = await Promise.all([
       dbGetAllFolders(),
@@ -1063,26 +1090,46 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 }));
 
 /** importSnapshotの入力を検証し、最低限の形が揃っているスナップショットへ整形する */
+/**
+ * importSnapshotの入力を検証し、最低限の形が揃っているスナップショットへ整形する。
+ * JSONファイルは端末外から持ち込まれる「信頼できない入力」であるため、DOMへ
+ * innerHTMLとして描画されるnode.contentは必ずsanitizeHtmlを通してから取り込む
+ * (<script>やonerror等を仕込んだ改ざんファイルによるXSSを防ぐため)。
+ */
 function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
   if (!data || typeof data !== "object") {
     throw new Error("JSONの形式が正しくありません");
   }
   const obj = data as Record<string, unknown>;
-  const folders = Array.isArray(obj.folders) ? (obj.folders as FolderData[]) : [];
-  const notes = Array.isArray(obj.notes) ? (obj.notes as NoteData[]) : [];
-  const nodes = Array.isArray(obj.nodes) ? (obj.nodes as OutlineNodeData[]) : [];
-  const isValidRecord = (r: unknown): r is { id: string } =>
+  const rawFolders = Array.isArray(obj.folders) ? obj.folders : [];
+  const rawNotes = Array.isArray(obj.notes) ? obj.notes : [];
+  const rawNodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+  const isValidRecord = (r: unknown): r is Record<string, unknown> =>
     !!r && typeof r === "object" && typeof (r as { id?: unknown }).id === "string";
   if (
-    !folders.every(isValidRecord) ||
-    !notes.every(isValidRecord) ||
-    !nodes.every(isValidRecord)
+    !rawFolders.every(isValidRecord) ||
+    !rawNotes.every(isValidRecord) ||
+    !rawNodes.every(isValidRecord)
   ) {
     throw new Error("JSONの中身がこのアプリの書き出し形式と一致しません");
   }
-  if (folders.length === 0 && notes.length === 0 && nodes.length === 0) {
+  if (rawFolders.length === 0 && rawNotes.length === 0 && rawNodes.length === 0) {
     throw new Error("読み込めるデータがありませんでした");
   }
+
+  const folders = (rawFolders as unknown as FolderData[]).map((f) => ({
+    ...f,
+    name: typeof f.name === "string" ? f.name : String(f.name ?? ""),
+  }));
+  const notes = (rawNotes as unknown as NoteData[]).map((n) => ({
+    ...n,
+    title: typeof n.title === "string" ? n.title : String(n.title ?? ""),
+  }));
+  const nodes = (rawNodes as unknown as OutlineNodeData[]).map((n) => ({
+    ...n,
+    content: sanitizeHtml(typeof n.content === "string" ? n.content : ""),
+  }));
+
   return { exportedAt: typeof obj.exportedAt === "string" ? obj.exportedAt : nowIso(), folders, notes, nodes };
 }
 
@@ -1153,6 +1200,17 @@ function markSynced(): void {
   const now = nowIso();
   useOutlineStore.setState({ syncStatus: "saved", lastSyncedAt: now });
   void dbSetMeta("lastSyncedAt", now);
+  void refreshPendingCount();
+}
+
+/**
+ * IndexedDB上の未送信件数(dirty + pendingDeletes)を数え直し、storeへ反映する。
+ * データ保護ステータスの表示(「クラウド同期済み」か「同期待ちがある」か)を
+ * 実際のローカルキューの残数と正しく連動させるために使う。
+ */
+async function refreshPendingCount(): Promise<void> {
+  const [dirty, pendingDeletes] = await Promise.all([dbGetAllDirty(), dbGetPendingDeletes()]);
+  useOutlineStore.setState({ pendingCount: dirty.length + pendingDeletes.length });
 }
 
 /**
@@ -1255,7 +1313,7 @@ async function persistNode(
     }
     const { error } = await client.from("nodes").upsert(nodeToRow(node, userId));
     if (error) {
-      console.error("[sync] ノードの保存に失敗しました:", error.message);
+      devError("[sync] ノードの保存に失敗しました:", error.message);
       await dbMarkDirty("nodes", node.id);
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
@@ -1302,7 +1360,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
   // 残りが同期時に復活してしまうため)
   const { error } = await client.from("nodes").delete().in("id", ids);
   if (error) {
-    console.error("[sync] ノードの削除に失敗しました:", error.message);
+    devError("[sync] ノードの削除に失敗しました:", error.message);
     await Promise.all(ids.map((id) => dbAddPendingDelete("nodes", id)));
     useOutlineStore.setState({ syncStatus: "error" });
   } else {
@@ -1331,7 +1389,7 @@ async function persistNote(
     }
     const { error } = await client.from("notes").upsert(noteToRow(note, userId));
     if (error) {
-      console.error("[sync] メモの保存に失敗しました:", error.message);
+      devError("[sync] メモの保存に失敗しました:", error.message);
       await dbMarkDirty("notes", note.id);
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
@@ -1369,7 +1427,7 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
   }
   const { error } = await client.from("notes").delete().eq("id", noteId);
   if (error) {
-    console.error("[sync] メモの削除に失敗しました:", error.message);
+    devError("[sync] メモの削除に失敗しました:", error.message);
     await dbAddPendingDelete("notes", noteId);
   }
 }
@@ -1395,7 +1453,7 @@ async function persistFolder(
     }
     const { error } = await client.from("folders").upsert(folderToRow(folder, userId));
     if (error) {
-      console.error("[sync] フォルダの保存に失敗しました:", error.message);
+      devError("[sync] フォルダの保存に失敗しました:", error.message);
       await dbMarkDirty("folders", folder.id);
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
@@ -1436,7 +1494,7 @@ async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: 
   }
   const { error } = await client.from("folders").delete().eq("id", folderId);
   if (error) {
-    console.error("[sync] フォルダの削除に失敗しました:", error.message);
+    devError("[sync] フォルダの削除に失敗しました:", error.message);
     await dbAddPendingDelete("folders", folderId);
   }
 }
@@ -1515,6 +1573,9 @@ function subscribeRealtime(noteId: string): () => void {
         }
 
         const incoming = nodeFromRow(payload.new as NodeRow);
+        // リアルタイムで受信した内容も、DOMへinnerHTMLとして描画する前に必ず
+        // サニタイズを通す(RLSで自分のデータしか流れてこないとはいえ、念のための多層防御)
+        incoming.content = sanitizeHtml(incoming.content);
         const existing = state.nodes[incoming.id];
         // 自分の書き込みのエコーや古い変更で上書きしないようにする
         if (existing && existing.updatedAt >= incoming.updatedAt) return;
