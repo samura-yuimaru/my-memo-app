@@ -87,6 +87,12 @@ interface OutlinerClipboardData {
   items: ClipboardNodeItem[];
 }
 
+/** サイドバーの複数選択で扱う項目の種類とid */
+export interface SidebarItemKey {
+  type: "note" | "folder";
+  id: string;
+}
+
 /** JSON書き出し/読み込み(データ保護モーダル)で使うスナップショットの形 */
 export interface OutlineSnapshot {
   exportedAt: string;
@@ -144,6 +150,16 @@ interface OutlineState {
   renameFolder: (folderId: string, name: string) => void;
   moveFolderTo: (folderId: string, newParentId: string | null) => void;
   deleteFolder: (folderId: string) => Promise<void>;
+
+  /** サイドバーでの複数選択(フォルダ・メモ横断)。一括削除・一括移動の対象になる */
+  sidebarSelection: SidebarItemKey[];
+  toggleSidebarSelection: (type: SidebarItemKey["type"], id: string) => void;
+  setSidebarSelection: (items: SidebarItemKey[]) => void;
+  clearSidebarSelection: () => void;
+  /** 選択中のフォルダ・メモをまとめて削除する */
+  deleteSidebarSelection: () => Promise<void>;
+  /** 選択中のフォルダ・メモをまとめて指定フォルダ(nullはフォルダなし)へ移動する */
+  moveSidebarSelectionToFolder: (folderId: string | null) => void;
 
   setActiveNodeId: (id: string | null) => void;
   requestFocus: (req: FocusRequest | null) => void;
@@ -259,6 +275,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   currentNoteId: null,
   nodes: {},
   loading: false,
+  sidebarSelection: [],
 
   activeNodeId: null,
   focusRequest: null,
@@ -543,6 +560,67 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       affectedNotes.map((n) => persistNote({ ...n, folderId: null, updatedAt: nowIso() }))
     );
     await persistDeleteFolderFull(folderId, toDelete);
+  },
+
+  toggleSidebarSelection: (type, id) => {
+    set((s) => {
+      const exists = s.sidebarSelection.some((it) => it.type === type && it.id === id);
+      return {
+        sidebarSelection: exists
+          ? s.sidebarSelection.filter((it) => !(it.type === type && it.id === id))
+          : [...s.sidebarSelection, { type, id }],
+      };
+    });
+  },
+  setSidebarSelection: (items) => set({ sidebarSelection: items }),
+  clearSidebarSelection: () => set({ sidebarSelection: [] }),
+
+  deleteSidebarSelection: async () => {
+    const { sidebarSelection } = get();
+    if (sidebarSelection.length === 0) return;
+    const noteIds = sidebarSelection.filter((it) => it.type === "note").map((it) => it.id);
+    // フォルダは配下を再帰的に削除するdeleteFolderに任せるため、選択に子孫フォルダが
+    // 含まれていても二重処理にならないよう、他の選択フォルダの子孫であるものは除外する
+    const folderIds = sidebarSelection.filter((it) => it.type === "folder").map((it) => it.id);
+    const selectedFolderSet = new Set(folderIds);
+    const { folders } = get();
+    const isDescendantOfAnotherSelected = (id: string): boolean => {
+      let current = folders.find((f) => f.id === id);
+      while (current?.parentId) {
+        if (selectedFolderSet.has(current.parentId)) return true;
+        current = folders.find((f) => f.id === current!.parentId);
+      }
+      return false;
+    };
+    const topLevelFolderIds = folderIds.filter((id) => !isDescendantOfAnotherSelected(id));
+
+    set({ sidebarSelection: [] });
+    for (const id of noteIds) await get().deleteNote(id);
+    for (const id of topLevelFolderIds) await get().deleteFolder(id);
+  },
+
+  moveSidebarSelectionToFolder: (folderId) => {
+    const { sidebarSelection, folders } = get();
+    if (sidebarSelection.length === 0) return;
+    const selectedFolderIds = new Set(
+      sidebarSelection.filter((it) => it.type === "folder").map((it) => it.id)
+    );
+    // 選択したフォルダ自身、またはその子孫フォルダへは移動できない(循環参照防止)
+    const isSelfOrDescendantOfSelected = (id: string | null): boolean => {
+      let current = folders.find((f) => f.id === id);
+      while (current) {
+        if (selectedFolderIds.has(current.id)) return true;
+        current = folders.find((f) => f.id === current!.parentId);
+      }
+      return false;
+    };
+    if (folderId && isSelfOrDescendantOfSelected(folderId)) return;
+
+    for (const item of sidebarSelection) {
+      if (item.type === "note") get().moveNoteToFolder(item.id, folderId);
+      else get().moveFolderTo(item.id, folderId);
+    }
+    set({ sidebarSelection: [] });
   },
 
   setActiveNodeId: (id) =>

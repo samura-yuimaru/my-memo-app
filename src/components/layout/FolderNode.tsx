@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronRight, Folder, FolderPlus, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
+import { useRef, useState } from "react";
+import { CheckSquare, ChevronRight, Folder, FolderPlus, MoreHorizontal, Pencil, Plus, Square, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
@@ -11,6 +11,7 @@ import { useLongPress } from "@/lib/utils/useLongPress";
 import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { NoteRow } from "./NoteRow";
 import { useSidebarDnd } from "./SidebarDndContext";
+import { useSidebarSelection } from "./SidebarSelectionContext";
 import type { FolderData, NoteData } from "@/types/outline";
 
 interface FolderNodeProps {
@@ -24,7 +25,10 @@ interface FolderNodeProps {
   onNewNote: (folderId: string) => void;
 }
 
-const INDENT = 12;
+/** 1階層あたりの字下げ幅。「1段下がった」ことがひと目でわかるよう、ツリーガイド線とあわせて広めに取る */
+const INDENT = 20;
+/** マウスでこの距離を超えて動いたら、クリックではなくドラッグ開始とみなす */
+const MOUSE_DRAG_THRESHOLD = 4;
 
 /** フォルダ1件分(見出し + 中のメモ + サブフォルダを再帰的に描画) */
 export function FolderNode({
@@ -41,6 +45,7 @@ export function FolderNode({
   const deleteFolder = useOutlineStore((s) => s.deleteFolder);
   const createFolder = useOutlineStore((s) => s.createFolder);
   const { draggingItem, dropTarget, startDragFolder } = useSidebarDnd();
+  const { selectionMode, isSelected, handleItemPress } = useSidebarSelection();
 
   const [collapsed, setCollapsed] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -54,6 +59,7 @@ export function FolderNode({
   const isDropTarget = dropTarget === folder.id;
   const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
   const isEmpty = childFolders.length === 0 && notes.length === 0;
+  const selected = isSelected("folder", folder.id);
 
   function startEditing() {
     setDraft(folder.name);
@@ -76,43 +82,93 @@ export function FolderNode({
     await deleteFolder(folder.id);
   }
 
-  // フォルダ名の押下は「ドラッグ移動」と「名前変更」がはっきり分かれるようにしている:
+  // フォルダ名の押下は「クリック(選択/折りたたみ)」「ドラッグ移動」「名前変更」の
+  // 3つがはっきり分かれるようにしている:
   // ・タッチ/ペン: 長押しでドラッグを開始する(短いタップは折りたたみのトグルのまま)
-  // ・マウス: 長押し不要で、押した瞬間からすぐにドラッグを開始できる(名前変更は
-  //   ダブルクリック/右クリックメニュー/「…」メニューに完全分離しているため、
-  //   1クリック=ドラッグ開始としても誤操作にならない)
+  // ・マウス: 一定距離(MOUSE_DRAG_THRESHOLD)を超えて動いた瞬間にドラッグを開始する。
+  //   ただのクリック(移動なし)ではドラッグが一切始まらないため、クリックのたびに
+  //   誤ってドラッグ状態が組まれてしまう(=クリックだけで挙動がおかしくなる)ことがない
   // 名前変更モードへの移行はダブルクリック・コンテキストメニュー・「…」メニューからのみ行い、
-  // 長押しでは絶対に起動しない(長押し→わずかなブレでドラッグと誤認する、といった
-  // 誤作動を避けるため)。
+  // クリックやドラッグでは絶対に起動しない。
   const longPress = useLongPress({
     onLongPress: ({ pointerId, target }) => {
       safeSetPointerCapture(target, pointerId);
       startDragFolder(folder.id);
     },
   });
+  const mouseDragRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+
   function handleNamePointerDown(e: React.PointerEvent<HTMLButtonElement>) {
     if (e.pointerType === "mouse") {
-      safeSetPointerCapture(e.currentTarget, e.pointerId);
-      startDragFolder(folder.id);
+      mouseDragRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
       return;
     }
     longPress.onPointerDown(e);
+  }
+  function handleNamePointerMove(e: React.PointerEvent<HTMLButtonElement>) {
+    if (e.pointerType === "mouse") {
+      const start = mouseDragRef.current;
+      if (!start) return;
+      const dx = e.clientX - start.x;
+      const dy = e.clientY - start.y;
+      if (Math.hypot(dx, dy) > MOUSE_DRAG_THRESHOLD) {
+        safeSetPointerCapture(e.currentTarget, start.pointerId);
+        startDragFolder(folder.id);
+        mouseDragRef.current = null;
+      }
+      return;
+    }
+    longPress.onPointerMove(e);
+  }
+  function handleNamePointerUp(e: React.PointerEvent<HTMLButtonElement>) {
+    mouseDragRef.current = null;
+    longPress.onPointerUp(e);
+  }
+  function handleNamePointerCancel(e: React.PointerEvent<HTMLButtonElement>) {
+    mouseDragRef.current = null;
+    longPress.onPointerCancel(e);
+  }
+
+  function handleNameClick(e: React.MouseEvent) {
+    const consumed = handleItemPress("folder", folder.id, {
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+    });
+    if (consumed) return;
+    setCollapsed((v) => !v);
   }
 
   return (
     <div className={clsx(isDraggingSelf && "opacity-40")}>
       <div
         data-folder-drop={folder.id}
-        className={clsx("rounded-lg", isDropTarget && SELECTED_BG_CLASS)}
+        className={clsx("relative rounded-lg", isDropTarget && SELECTED_BG_CLASS)}
         style={{ paddingLeft: depth * INDENT }}
       >
+        {depth > 0 && <SidebarIndentGuides depth={depth} />}
+
         <div
-          className="group/actions flex items-center gap-0.5 rounded-lg px-1 py-1"
+          className={clsx(
+            "group/actions flex items-center gap-1 rounded-lg px-1 py-1.5",
+            selected && !isDropTarget && "bg-accent-100 dark:bg-accent-500/15"
+          )}
           onContextMenu={(e) => {
             e.preventDefault();
             setMenuOpen(true);
           }}
         >
+          {selectionMode && (
+            <button
+              type="button"
+              onClick={() => handleItemPress("folder", folder.id, { ctrlKey: true, metaKey: false, shiftKey: false })}
+              className="flex h-6 w-6 shrink-0 items-center justify-center text-accent-600"
+              aria-label={selected ? "選択解除" : "選択"}
+            >
+              {selected ? <CheckSquare size={17} /> : <Square size={17} className="text-ink-300" />}
+            </button>
+          )}
+
           {isEmpty ? (
             // 中身が何もないフォルダは開閉しても表示が変わらないため、トグル矢印自体を
             // 出さない(誤操作の余地をなくし、サイドバーの視覚的なノイズも減らす)
@@ -127,7 +183,7 @@ export function FolderNode({
                 isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
               )}
             >
-              <ChevronRight size={14} className={clsx("transition-transform", !collapsed && "rotate-90")} />
+              <ChevronRight size={16} className={clsx("transition-transform", !collapsed && "rotate-90")} />
             </button>
           )}
 
@@ -147,30 +203,31 @@ export function FolderNode({
                   setEditing(false);
                 }
               }}
-              className="min-w-0 flex-1 rounded border border-accent-300 bg-surface px-1.5 py-0.5 text-sm text-ink-800 outline-none"
+              className="min-w-0 flex-1 rounded border border-accent-300 bg-surface px-1.5 py-0.5 text-base text-ink-800 outline-none"
             />
           ) : (
             <button
               type="button"
+              data-sidebar-item={`folder:${folder.id}`}
               data-drag-handle="true"
               onContextMenu={(e) => e.preventDefault()}
               onPointerDown={handleNamePointerDown}
-              onPointerMove={longPress.onPointerMove}
-              onPointerUp={longPress.onPointerUp}
-              onPointerCancel={longPress.onPointerCancel}
-              onClick={() => setCollapsed((v) => !v)}
+              onPointerMove={handleNamePointerMove}
+              onPointerUp={handleNamePointerUp}
+              onPointerCancel={handleNamePointerCancel}
+              onClick={handleNameClick}
               onDoubleClick={(e) => {
                 e.preventDefault();
                 startEditing();
               }}
               title={folder.name}
               className={clsx(
-                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium hover:bg-ink-100 active:cursor-grabbing",
+                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-base font-medium hover:bg-ink-100 active:cursor-grabbing",
                 isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700",
                 NO_IOS_CALLOUT
               )}
             >
-              <Folder size={14} className="shrink-0 opacity-70" aria-hidden="true" />
+              <Folder size={16} className="shrink-0 opacity-70" aria-hidden="true" />
               <span className="min-w-0 flex-1 truncate">{folder.name}</span>
             </button>
           )}
@@ -184,7 +241,7 @@ export function FolderNode({
               onClick={() => setMenuOpen((v) => !v)}
               className={actionIconClass(menuOpen || editing)}
             >
-              <MoreHorizontal size={14} />
+              <MoreHorizontal size={16} />
             </IconButton>
             <Popover open={menuOpen} onClose={() => setMenuOpen(false)} className="md:right-0 md:top-full md:mt-1 md:w-48">
               <div className="flex flex-col gap-0.5">
@@ -242,10 +299,9 @@ export function FolderNode({
                 onNewNote={onNewNote}
               />
             ))}
-            {/* 空フォルダでドラッグ中でもない場合は<ul>ごと出さない(無駄な余白を作らない)。
-                「ここにドロップ」ガイドは常時表示せず、実際に何かをドラッグしている間だけ
-                ドロップ可能エリアとして点線枠で示す */}
-            {(!isEmpty || draggingItem) && (
+            {/* 空フォルダは中身の<ul>ごと出さない(無駄な余白を作らない)。ドロップ可能かどうかは
+                青いハイライト(isDropTarget)だけで示し、案内テキストは表示しない */}
+            {!isEmpty && (
               <ul className="flex flex-col gap-0.5 py-0.5" style={{ paddingLeft: (depth + 1) * INDENT }}>
                 {notes.map((note) => (
                   <NoteRow
@@ -256,23 +312,26 @@ export function FolderNode({
                     onDelete={(e) => onDeleteNote(e, note.id, note.title)}
                   />
                 ))}
-                {isEmpty && draggingItem && (
-                  <li
-                    className={clsx(
-                      "rounded-lg border-2 border-dashed px-2 py-2 text-center text-xs font-medium",
-                      isDropTarget
-                        ? "border-[#0d0f14]/40 text-[#0d0f14]"
-                        : "border-accent-300 text-accent-500 dark:border-accent-400/50 dark:text-accent-300"
-                    )}
-                  >
-                    ここにドロップ
-                  </li>
-                )}
               </ul>
             )}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/** サイドバーのツリー階層を示す縦のガイド線(アウトライン本体のIndentGuidesと同じ考え方) */
+function SidebarIndentGuides({ depth }: { depth: number }) {
+  return (
+    <div className="pointer-events-none absolute inset-y-0 left-0" aria-hidden="true">
+      {Array.from({ length: depth }).map((_, i) => (
+        <span
+          key={i}
+          className="absolute top-0 h-full w-px bg-ink-200"
+          style={{ left: i * INDENT + INDENT / 2 }}
+        />
+      ))}
     </div>
   );
 }
