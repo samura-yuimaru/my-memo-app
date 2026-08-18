@@ -8,7 +8,7 @@ import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
 import { useLongPress } from "@/lib/utils/useLongPress";
-import { actionIconClass, NO_IOS_CALLOUT } from "@/lib/uiClasses";
+import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { NoteRow } from "./NoteRow";
 import { useSidebarDnd } from "./SidebarDndContext";
 import type { FolderData, NoteData } from "@/types/outline";
@@ -89,7 +89,7 @@ export function FolderNode({
     <div className={clsx(isDraggingSelf && "opacity-40")}>
       <div
         data-folder-drop={folder.id}
-        className={clsx("rounded-lg", isDropTarget && "bg-accent-100 dark:bg-accent-500/15")}
+        className={clsx("rounded-lg", isDropTarget && SELECTED_BG_CLASS)}
         style={{ paddingLeft: depth * INDENT }}
       >
         <div
@@ -103,7 +103,10 @@ export function FolderNode({
             type="button"
             onClick={() => setCollapsed((v) => !v)}
             title={collapsed ? "展開する" : "折りたたむ"}
-            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-400 hover:bg-ink-100 dark:hover:bg-ink-700"
+            className={clsx(
+              "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100 dark:hover:bg-ink-700",
+              isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
+            )}
           >
             <ChevronRight size={14} className={clsx("transition-transform", !collapsed && "rotate-90")} />
           </button>
@@ -135,7 +138,8 @@ export function FolderNode({
               onClick={() => setCollapsed((v) => !v)}
               title={folder.name}
               className={clsx(
-                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium text-ink-700 hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700",
+                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700",
+                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700",
                 NO_IOS_CALLOUT
               )}
             >

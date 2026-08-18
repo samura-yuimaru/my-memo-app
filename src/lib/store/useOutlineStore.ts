@@ -289,7 +289,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const userId = get().userId;
     if (!client || !userId) return;
 
-    const { data, error } = await client.from("folders").select("*").eq("user_id", userId);
+    const { data, error } = await safeCall(() =>
+      client.from("folders").select("*").eq("user_id", userId)
+    );
     if (error) {
       devError("[sync] フォルダ一覧の取得に失敗しました:", error.message);
       return;
@@ -308,10 +310,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const userId = get().userId;
     if (!client || !userId) return;
 
-    const { data, error } = await client
-      .from("notes")
-      .select("*")
-      .eq("user_id", userId);
+    const { data, error } = await safeCall(() =>
+      client.from("notes").select("*").eq("user_id", userId)
+    );
     if (error) {
       devError("[sync] メモ一覧の取得に失敗しました:", error.message);
       return;
@@ -347,7 +348,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const client = getSupabaseClient();
     const userId = get().userId;
     if (client && userId) {
-      const { data, error } = await client.from("nodes").select("*").eq("note_id", noteId);
+      const { data, error } = await safeCall(() =>
+        client.from("nodes").select("*").eq("note_id", noteId)
+      );
       if (!error && data) {
         const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
         const merged = mergeByUpdatedAt(Object.values(get().nodes), remoteNodes);
@@ -1196,6 +1199,26 @@ function toMap(nodes: OutlineNodeData[]): Record<string, OutlineNodeData> {
  * データ保護ステータスのモーダルに表示する「最終同期日時」も更新・永続化する
  * (頻繁に呼ばれるためIndexedDBへの書き込みは投げっぱなしにし、待ち合わせない)
  */
+/**
+ * Supabase呼び出しをtry/catchで包み、ネットワーク例外(完全なオフライン化・DNS失敗・
+ * タイムアウト等でfetch自体が例外を投げるケース)もPostgrestErrorと同じ{error}形へ
+ * 正規化する共通ラッパー。supabase-jsは通常APIエラーを{error}フィールドとして返すが、
+ * 接続そのものが失敗した場合は例外を投げることがあるため、どちらの経路でも必ず
+ * 同じエラーハンドリング(dirty化・再送キュー登録・syncStatus更新)を通るようにし、
+ * ネットワーク瞬断時にローカルの変更が黙って失われる(=再送キューに載らない)ことを防ぐ。
+ */
+async function safeCall<F extends () => PromiseLike<{ error: { message: string } | null }>>(
+  fn: F
+): Promise<Awaited<ReturnType<F>>> {
+  try {
+    return (await fn()) as Awaited<ReturnType<F>>;
+  } catch (err) {
+    return {
+      error: { message: err instanceof Error ? err.message : "ネットワークエラーが発生しました" },
+    } as Awaited<ReturnType<F>>;
+  }
+}
+
 function markSynced(): void {
   const now = nowIso();
   useOutlineStore.setState({ syncStatus: "saved", lastSyncedAt: now });
@@ -1237,6 +1260,12 @@ async function connectSupabase(): Promise<boolean> {
     await flushPendingSync();
     markSynced();
     return true;
+  } catch (err) {
+    // IndexedDBの一時的な失敗等、予期しない例外が起きてもクラッシュさせず
+    // エラー状態として扱う(呼び出し元は再接続ボタンで再試行できる)
+    devError("[supabase] 接続処理で予期しないエラーが発生しました:", err instanceof Error ? err.message : err);
+    useOutlineStore.setState({ syncStatus: "error" });
+    return false;
   } finally {
     useOutlineStore.setState({ reconnecting: false });
   }
@@ -1311,7 +1340,7 @@ async function persistNode(
       useOutlineStore.setState({ syncStatus: "offline" });
       return;
     }
-    const { error } = await client.from("nodes").upsert(nodeToRow(node, userId));
+    const { error } = await safeCall(() => client.from("nodes").upsert(nodeToRow(node, userId)));
     if (error) {
       devError("[sync] ノードの保存に失敗しました:", error.message);
       await dbMarkDirty("nodes", node.id);
@@ -1358,7 +1387,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
   }
   // 複数件まとめて削除する場合も、渡されたid全件をリモートから消す(先頭1件だけの削除だと
   // 残りが同期時に復活してしまうため)
-  const { error } = await client.from("nodes").delete().in("id", ids);
+  const { error } = await safeCall(() => client.from("nodes").delete().in("id", ids));
   if (error) {
     devError("[sync] ノードの削除に失敗しました:", error.message);
     await Promise.all(ids.map((id) => dbAddPendingDelete("nodes", id)));
@@ -1387,7 +1416,7 @@ async function persistNote(
       useOutlineStore.setState({ syncStatus: "offline" });
       return;
     }
-    const { error } = await client.from("notes").upsert(noteToRow(note, userId));
+    const { error } = await safeCall(() => client.from("notes").upsert(noteToRow(note, userId)));
     if (error) {
       devError("[sync] メモの保存に失敗しました:", error.message);
       await dbMarkDirty("notes", note.id);
@@ -1425,7 +1454,7 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
     await dbAddPendingDelete("notes", noteId);
     return;
   }
-  const { error } = await client.from("notes").delete().eq("id", noteId);
+  const { error } = await safeCall(() => client.from("notes").delete().eq("id", noteId));
   if (error) {
     devError("[sync] メモの削除に失敗しました:", error.message);
     await dbAddPendingDelete("notes", noteId);
@@ -1451,7 +1480,7 @@ async function persistFolder(
       useOutlineStore.setState({ syncStatus: "offline" });
       return;
     }
-    const { error } = await client.from("folders").upsert(folderToRow(folder, userId));
+    const { error } = await safeCall(() => client.from("folders").upsert(folderToRow(folder, userId)));
     if (error) {
       devError("[sync] フォルダの保存に失敗しました:", error.message);
       await dbMarkDirty("folders", folder.id);
@@ -1492,7 +1521,7 @@ async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: 
     await dbAddPendingDelete("folders", folderId);
     return;
   }
-  const { error } = await client.from("folders").delete().eq("id", folderId);
+  const { error } = await safeCall(() => client.from("folders").delete().eq("id", folderId));
   if (error) {
     devError("[sync] フォルダの削除に失敗しました:", error.message);
     await dbAddPendingDelete("folders", folderId);
@@ -1508,7 +1537,7 @@ export async function flushPendingSync(): Promise<void> {
 
   const pendingDeletes = await dbGetPendingDeletes();
   for (const pd of pendingDeletes) {
-    const { error } = await client.from(pd.table).delete().eq("id", pd.recordId);
+    const { error } = await safeCall(() => client.from(pd.table).delete().eq("id", pd.recordId));
     if (!error) await dbClearPendingDelete(pd.key);
   }
 
@@ -1520,7 +1549,7 @@ export async function flushPendingSync(): Promise<void> {
         await dbClearDirty("nodes", d.recordId);
         continue;
       }
-      const { error } = await client.from("nodes").upsert(nodeToRow(node, userId));
+      const { error } = await safeCall(() => client.from("nodes").upsert(nodeToRow(node, userId)));
       if (!error) await dbClearDirty("nodes", d.recordId);
     } else if (d.table === "notes") {
       const note = (await dbGetAllNotes()).find((n) => n.id === d.recordId);
@@ -1528,7 +1557,7 @@ export async function flushPendingSync(): Promise<void> {
         await dbClearDirty("notes", d.recordId);
         continue;
       }
-      const { error } = await client.from("notes").upsert(noteToRow(note, userId));
+      const { error } = await safeCall(() => client.from("notes").upsert(noteToRow(note, userId)));
       if (!error) await dbClearDirty("notes", d.recordId);
     } else {
       const folder = (await dbGetAllFolders()).find((f) => f.id === d.recordId);
@@ -1536,7 +1565,7 @@ export async function flushPendingSync(): Promise<void> {
         await dbClearDirty("folders", d.recordId);
         continue;
       }
-      const { error } = await client.from("folders").upsert(folderToRow(folder, userId));
+      const { error } = await safeCall(() => client.from("folders").upsert(folderToRow(folder, userId)));
       if (!error) await dbClearDirty("folders", d.recordId);
     }
   }

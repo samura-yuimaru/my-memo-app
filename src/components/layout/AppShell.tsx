@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
-import { MobileToolbar } from "./MobileToolbar";
-import { KeyboardToolbar } from "./KeyboardToolbar";
+import { OutlineToolbar } from "./OutlineToolbar";
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 440;
@@ -67,7 +67,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           className="relative hidden shrink-0 border-r border-ink-100 md:block"
           style={{ width: sidebarWidth }}
         >
-          <Sidebar />
+          <ErrorBoundary label="サイドバー">
+            <Sidebar />
+          </ErrorBoundary>
           <div
             onPointerDown={handleResizePointerDown}
             onPointerMove={handleResizePointerMove}
@@ -121,16 +123,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 <X size={18} />
               </button>
             </div>
-            <Sidebar onNavigate={() => setMobileMenuOpen(false)} />
+            <ErrorBoundary label="サイドバー">
+              <Sidebar onNavigate={() => setMobileMenuOpen(false)} />
+            </ErrorBoundary>
           </div>
         </div>
       )}
 
       <div className="flex min-w-0 flex-1 flex-col">
         <Header onMenuClick={() => setMobileMenuOpen(true)} />
-        <main className="flex-1 overflow-y-auto overscroll-contain">{children}</main>
-        <MobileToolbar />
-        <KeyboardToolbar />
+        <main className="flex-1 overflow-y-auto overscroll-contain">
+          <ErrorBoundary label="アウトライン">{children}</ErrorBoundary>
+        </main>
+        <OutlineToolbar />
       </div>
     </div>
   );

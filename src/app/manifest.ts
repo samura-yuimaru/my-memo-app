@@ -2,8 +2,8 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "My Memo",
-    short_name: "My Memo",
+    name: "OutLiner",
+    short_name: "OutLiner",
     description:
       "書いた瞬間に自動保存・自動同期される、無限階層のアウトライナーメモアプリ",
     start_url: "/",

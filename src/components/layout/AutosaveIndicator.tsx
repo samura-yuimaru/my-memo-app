@@ -134,7 +134,7 @@ export function AutosaveIndicator() {
     const a = document.createElement("a");
     a.href = url;
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    a.download = `my-memo-backup-${ts}.json`;
+    a.download = `outliner-backup-${ts}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();

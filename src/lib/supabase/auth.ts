@@ -19,14 +19,24 @@ export async function ensureAnonymousSession(retries = 3): Promise<Session | nul
   const client = getSupabaseClient();
   if (!client) return null;
 
-  const { data: sessionData } = await client.auth.getSession();
-  if (sessionData.session) return sessionData.session;
+  try {
+    const { data: sessionData } = await client.auth.getSession();
+    if (sessionData.session) return sessionData.session;
+  } catch (err) {
+    devError("[supabase] 既存セッションの確認に失敗しました:", err instanceof Error ? err.message : err);
+  }
 
   let lastErrorMessage = "不明なエラー";
   for (let attempt = 0; attempt < Math.max(1, retries); attempt++) {
-    const { data, error } = await client.auth.signInAnonymously();
-    if (!error && data.session) return data.session;
-    lastErrorMessage = error?.message ?? lastErrorMessage;
+    try {
+      const { data, error } = await client.auth.signInAnonymously();
+      if (!error && data.session) return data.session;
+      lastErrorMessage = error?.message ?? lastErrorMessage;
+    } catch (err) {
+      // 完全なネットワーク遮断等でfetch自体が例外を投げた場合も、通常のAPIエラーと
+      // 同じリトライ経路に載せる(クラッシュさせず、次の試行へ進む)
+      lastErrorMessage = err instanceof Error ? err.message : "ネットワークエラー";
+    }
     if (attempt < retries - 1) await sleep(500 * 2 ** attempt); // 500ms → 1000ms → 2000ms…
   }
   devError("[supabase] 匿名サインインに失敗しました:", lastErrorMessage);

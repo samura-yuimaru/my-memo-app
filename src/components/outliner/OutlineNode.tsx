@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef } from "react";
+import { memo, useRef } from "react";
 import clsx from "clsx";
 import { Trash2 } from "lucide-react";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
@@ -28,7 +28,7 @@ interface OutlineNodeProps {
 }
 
 /** アウトラインの1行(とその配下)を再帰的に描画する */
-export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNodeProps) {
+function OutlineNodeComponent({ node, depth, insideSmartBlock = false }: OutlineNodeProps) {
   const toggleCollapse = useOutlineStore((s) => s.toggleCollapse);
   const setTextColor = useOutlineStore((s) => s.setTextColor);
   const insertSmartBlock = useOutlineStore((s) => s.insertSmartBlock);
@@ -165,6 +165,42 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
     </div>
   );
 }
+
+/**
+ * OutlineNodeのprops等価判定(パフォーマンス最適化)。
+ * buildTreeは呼ばれるたびにすべてのノードを新しいオブジェクトとして作り直すため、
+ * 内容が変わっていないノードでも参照は毎回別物になる。そのままではediting中に
+ * 1000行規模のツリーが毎回すべて再レンダリングされてしまうため、ここでは
+ * 「このノード自身のフィールド」と「直下の子の並び(id列)」だけを値で比較する
+ * 浅い等価判定を行い、変更のあった行の祖先チェーンだけを再レンダリングする
+ * (孫以下の内容変化は、その子自身のmemo判定に任せることで二重にチェックしない)。
+ * なお選択中/ドラッグ中などの見た目の変化はprops経由ではなくuseOutlineStoreの
+ * 購読で個別に検知されるため、ここでの判定とは独立して正しく再レンダリングされる。
+ */
+function arePropsEqual(prev: OutlineNodeProps, next: OutlineNodeProps): boolean {
+  if (prev.depth !== next.depth || prev.insideSmartBlock !== next.insideSmartBlock) return false;
+  const a = prev.node;
+  const b = next.node;
+  if (a === b) return true;
+  if (
+    a.id !== b.id ||
+    a.content !== b.content ||
+    a.collapsed !== b.collapsed ||
+    a.nodeType !== b.nodeType ||
+    a.textColor !== b.textColor ||
+    a.parentId !== b.parentId ||
+    a.position !== b.position ||
+    a.children.length !== b.children.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < a.children.length; i++) {
+    if (a.children[i].id !== b.children[i].id) return false;
+  }
+  return true;
+}
+
+export const OutlineNode = memo(OutlineNodeComponent, arePropsEqual);
 
 function IndentGuides({ depth }: { depth: number }) {
   return (

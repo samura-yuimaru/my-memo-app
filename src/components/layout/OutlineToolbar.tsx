@@ -2,26 +2,27 @@
 
 import { useEffect, useState } from "react";
 import { ChevronsLeft, ChevronsRight, CornerDownLeft, CornerDownRight } from "lucide-react";
+import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
+import { IconButton } from "@/components/ui/IconButton";
 
 function isEditableElement(el: Element | null): el is HTMLElement {
   return !!el && el instanceof HTMLElement && el.isContentEditable;
 }
 
 /**
- * iPad/スマホでソフトウェアキーボードが表示されている間だけ、キーボードのすぐ上に
- * 固定表示されるミニツールバー。画面最下部固定のMobileToolbarは、キーボード表示中は
- * その下に隠れてしまう(iOS Safariはキーボード表示時にレイアウトビューポート自体は
- * 縮めないため、position:fixedをbottom:0にしても画面外に取り残される)。
- * そこでwindow.visualViewportの高さを監視し、キーボードの上端の実際の位置に追従させる。
- *
- * ボタンは中央揃えで次の4つのみ:
- *   << インデント解除(親と同じ階層に戻す) / >> インデントを下げる(子にする)
- *   ↲ 元に戻す(Undo) / ↳ やり直す(Redo)
- * Undo/Redoは、現在編集中のテキストも含めたuseOutlineStoreのノード操作履歴
- * (undo/redoアクション)とそのまま連携する(MobileToolbarの元に戻す/やり直すボタンと同じ実体)。
+ * アウトライン操作用のツールバー(≪インデント解除・≫インデント・↲元に戻す・↳やり直す)。
+ * ソフトウェアキーボードの表示有無に関わらず、常に「同一のコンポーネント・同一のボタン定義・
+ * 同一のイベント処理」を描画する一元化された設計にしている(以前はキーボード表示中の
+ * 浮遊ツールバーと非表示中の標準操作バーとで、KeyboardToolbar/MobileToolbarという
+ * 別々のコンポーネント・別ロジックが存在しており、ボタン構成や挙動が微妙に食い違っていた)。
+ * 状態によって変わるのは「位置」だけ:
+ *   - キーボード非表示時: 画面下部に固定表示(sticky bottom-0)。PCでもクリックで使える
+ *   - キーボード表示時  : window.visualViewportで検出したキーボードの上端に浮遊追従(fixed)
+ * インデント操作は「現在フォーカス/選択中のノード」(activeNodeId)に対して行い、
+ * Undo/Redoは編集中のテキストも含むuseOutlineStoreのノード操作履歴と直結する。
  */
-export function KeyboardToolbar() {
+export function OutlineToolbar() {
   const currentNoteId = useOutlineStore((s) => s.currentNoteId);
   const activeNodeId = useOutlineStore((s) => s.activeNodeId);
   const indentNode = useOutlineStore((s) => s.indentNode);
@@ -53,15 +54,15 @@ export function KeyboardToolbar() {
     };
   }, []);
 
-  // visualViewportの高さからソフトウェアキーボードの高さを推定し、
-  // ツールバーをちょうどキーボードの上端に位置させる
+  // visualViewportの高さからソフトウェアキーボードの高さを推定する
+  // (iOS Safariはキーボード表示時にレイアウトビューポート自体は縮めないため、
+  //  sticky/fixedをbottom:0のままにしているとキーボードの下に隠れてしまう)
   useEffect(() => {
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     if (!vv) return;
     function update() {
       if (!vv) return;
-      const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-      setKeyboardInset(inset);
+      setKeyboardInset(Math.max(0, window.innerHeight - vv.height - vv.offsetTop));
     }
     update();
     vv.addEventListener("resize", update);
@@ -72,9 +73,12 @@ export function KeyboardToolbar() {
     };
   }, []);
 
-  // ソフトウェアキーボードが実際に開いている(=一定以上の高さがある)、かつ
-  // ノードを編集中の場合のみ表示する。外付けキーボード使用時は自然に表示されない
-  if (!currentNoteId || !activeNodeId || !editingFocused || keyboardInset < 80) return null;
+  if (!currentNoteId) return null;
+
+  const noSelection = !activeNodeId;
+  // ソフトウェアキーボードが実際に開いている(=一定以上の高さがある)、かつ編集中の場合だけ
+  // 浮遊表示に切り替える。外付けキーボード使用時は自然にfalseのままになる
+  const keyboardVisible = editingFocused && keyboardInset >= 80;
 
   // ボタン押下でフォーカス(とキャレット位置)を失わないよう、pointerdown時点で既定動作を止める
   function preserveFocus(e: React.PointerEvent) {
@@ -86,11 +90,13 @@ export function KeyboardToolbar() {
       label: "インデント解除(親と同じ階層に戻す)",
       icon: <ChevronsLeft size={19} />,
       onClick: () => activeNodeId && outdentNode(activeNodeId),
+      disabled: noSelection,
     },
     {
       label: "インデントを下げる(1つ上の子にする)",
       icon: <ChevronsRight size={19} />,
       onClick: () => activeNodeId && indentNode(activeNodeId),
+      disabled: noSelection,
     },
     {
       label: "元に戻す",
@@ -108,22 +114,27 @@ export function KeyboardToolbar() {
 
   return (
     <div
-      className="fixed inset-x-0 z-30 flex items-center justify-center gap-1 border-t border-ink-200 bg-surface-alt/95 px-2 py-1.5 shadow-[0_-1px_6px_rgba(0,0,0,0.06)] backdrop-blur"
-      style={{ bottom: keyboardInset }}
+      className={clsx(
+        "z-30 flex items-center justify-center gap-1 border-t border-ink-200 bg-surface-alt/95 px-2 py-1.5 backdrop-blur",
+        keyboardVisible ? "fixed inset-x-0 shadow-[0_-1px_6px_rgba(0,0,0,0.06)]" : "sticky bottom-0"
+      )}
+      style={
+        keyboardVisible
+          ? { bottom: keyboardInset }
+          : { paddingBottom: "max(0.375rem, env(safe-area-inset-bottom))" }
+      }
     >
       {buttons.map((b) => (
-        <button
+        <IconButton
           key={b.label}
-          type="button"
+          label={b.label}
+          size="lg"
           disabled={b.disabled}
           onPointerDown={preserveFocus}
           onClick={b.onClick}
-          title={b.label}
-          aria-label={b.label}
-          className="flex h-9 min-w-[2.75rem] items-center justify-center rounded-md px-2 text-ink-600 hover:bg-ink-100 active:bg-ink-200 disabled:pointer-events-none disabled:opacity-30"
         >
           {b.icon}
-        </button>
+        </IconButton>
       ))}
     </div>
   );

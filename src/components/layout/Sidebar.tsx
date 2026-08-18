@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { FilePlus2, FolderPlus } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
+import { SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { BrandHeader } from "./BrandHeader";
 import { FolderNode } from "./FolderNode";
 import { NoteRow } from "./NoteRow";
@@ -156,12 +157,14 @@ export function Sidebar({ onNavigate }: SidebarProps) {
           {/* 未分類(フォルダなし)セクション: ルート領域自体が明確なドロップ対象になる */}
           <div
             data-folder-drop="unfiled"
-            className={clsx(
-              "mt-1 rounded-lg pb-1",
-              dropTarget === "unfiled" && "bg-accent-100 dark:bg-accent-500/15"
-            )}
+            className={clsx("mt-1 rounded-lg pb-1", dropTarget === "unfiled" && SELECTED_BG_CLASS)}
           >
-            <div className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-400">
+            <div
+              className={clsx(
+                "flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide",
+                dropTarget === "unfiled" ? SELECTED_TEXT_CLASS : "text-ink-400"
+              )}
+            >
               フォルダなし
             </div>
             <ul className="flex flex-col gap-0.5 py-0.5 pl-1">

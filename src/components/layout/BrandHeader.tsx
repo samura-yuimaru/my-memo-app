@@ -19,7 +19,7 @@ export function BrandHeader() {
         <rect x={6} y={12} width={9} height={2} rx={1} fill="#ffffff" />
         <rect x={6} y={15.5} width={6} height={2} rx={1} fill="#ffffff" />
       </svg>
-      <span className="text-[15px] font-semibold tracking-tight text-ink-800">My Memo</span>
+      <span className="text-[15px] font-semibold tracking-tight text-ink-800">OutLiner</span>
     </div>
   );
 }

@@ -3,17 +3,18 @@ import "./globals.css";
 import { ThemeProvider } from "@/components/providers/ThemeProvider";
 import { AppProviders } from "@/components/providers/AppProviders";
 import { AppShell } from "@/components/layout/AppShell";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export const metadata: Metadata = {
-  title: "アウトライナーメモ",
+  title: "OutLiner(アウトライナー)",
   description: "書いた瞬間に自動保存・自動同期される、無限階層のアウトライナーメモアプリ",
-  applicationName: "My Memo",
+  applicationName: "OutLiner",
   // iPadなどで「ホーム画面に追加」した際、Safariのアドレスバーを隠して
   // ネイティブアプリ風の全画面(standalone)表示にするためのメタタグ群
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "My Memo",
+    title: "OutLiner",
   },
   formatDetection: {
     telephone: false,
@@ -43,7 +44,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="bg-surface text-ink-900 antialiased">
         <ThemeProvider>
           <AppProviders>
-            <AppShell>{children}</AppShell>
+            <ErrorBoundary label="アプリ">
+              <AppShell>{children}</AppShell>
+            </ErrorBoundary>
           </AppProviders>
         </ThemeProvider>
       </body>
