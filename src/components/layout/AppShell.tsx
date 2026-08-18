@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { X } from "lucide-react";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
@@ -29,13 +29,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  function toggleSidebar() {
+  const toggleSidebar = useCallback(() => {
     setSidebarOpen((v) => {
       const next = !v;
       window.localStorage.setItem("sidebar-open", next ? "1" : "0");
       return next;
     });
-  }
+  }, []);
+
+  // Ctrl+\ (Macは Cmd+\) でサイドバーの開閉をトグルできるようにする(集中モード用の
+  // キーボードショートカット。入力欄にフォーカスがあっても構わず発動してよい組み合わせ)
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
+        e.preventDefault();
+        toggleSidebar();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [toggleSidebar]);
 
   const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
     try {
@@ -81,29 +94,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       )}
 
-      {sidebarOpen ? (
-        <button
-          type="button"
-          onClick={toggleSidebar}
-          title="サイドバーを閉じる"
-          aria-label="サイドバーを閉じる"
-          className="fixed top-16 z-30 hidden h-6 w-6 items-center justify-center rounded-full border border-ink-200 bg-surface text-ink-400 shadow-sm hover:bg-ink-50 md:flex"
-          style={{ left: sidebarWidth - 12 }}
-        >
-          <ChevronLeft size={13} />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={toggleSidebar}
-          title="サイドバーを開く"
-          aria-label="サイドバーを開く"
-          className="fixed left-2 top-16 z-30 hidden h-6 w-6 items-center justify-center rounded-full border border-ink-200 bg-surface text-ink-400 shadow-sm hover:bg-ink-50 md:flex"
-        >
-          <ChevronRight size={13} />
-        </button>
-      )}
-
       {/* モバイル/タブレット用のドロワー */}
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-40 md:hidden">
@@ -131,7 +121,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       )}
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <Header onMenuClick={() => setMobileMenuOpen(true)} />
+        <Header
+          onMenuClick={() => setMobileMenuOpen(true)}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={toggleSidebar}
+        />
         <main className="flex-1 overflow-y-auto overscroll-contain">
           <ErrorBoundary label="アウトライン">{children}</ErrorBoundary>
         </main>

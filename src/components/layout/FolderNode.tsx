@@ -53,6 +53,7 @@ export function FolderNode({
   const notes = notesList.filter((n) => (n.folderId ?? null) === folder.id);
   const isDropTarget = dropTarget === folder.id;
   const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
+  const isEmpty = childFolders.length === 0 && notes.length === 0;
 
   function startEditing() {
     setDraft(folder.name);
@@ -99,17 +100,23 @@ export function FolderNode({
             setMenuOpen(true);
           }}
         >
-          <button
-            type="button"
-            onClick={() => setCollapsed((v) => !v)}
-            title={collapsed ? "展開する" : "折りたたむ"}
-            className={clsx(
-              "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100 dark:hover:bg-ink-700",
-              isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
-            )}
-          >
-            <ChevronRight size={14} className={clsx("transition-transform", !collapsed && "rotate-90")} />
-          </button>
+          {isEmpty ? (
+            // 中身が何もないフォルダは開閉しても表示が変わらないため、トグル矢印自体を
+            // 出さない(誤操作の余地をなくし、サイドバーの視覚的なノイズも減らす)
+            <span className="h-6 w-6 shrink-0" aria-hidden="true" />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setCollapsed((v) => !v)}
+              title={collapsed ? "展開する" : "折りたたむ"}
+              className={clsx(
+                "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100",
+                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
+              )}
+            >
+              <ChevronRight size={14} className={clsx("transition-transform", !collapsed && "rotate-90")} />
+            </button>
+          )}
 
           {editing ? (
             <input
@@ -138,7 +145,7 @@ export function FolderNode({
               onClick={() => setCollapsed((v) => !v)}
               title={folder.name}
               className={clsx(
-                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700",
+                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium hover:bg-ink-100 active:cursor-grabbing",
                 isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700",
                 NO_IOS_CALLOUT
               )}
@@ -214,20 +221,34 @@ export function FolderNode({
                 onNewNote={onNewNote}
               />
             ))}
-            <ul className="flex flex-col gap-0.5 py-0.5" style={{ paddingLeft: (depth + 1) * INDENT }}>
-              {notes.map((note) => (
-                <NoteRow
-                  key={note.id}
-                  note={note}
-                  active={currentNoteId === note.id}
-                  onOpen={() => onOpenNote(note.id)}
-                  onDelete={(e) => onDeleteNote(e, note.id, note.title)}
-                />
-              ))}
-              {notes.length === 0 && childFolders.length === 0 && (
-                <li className="px-2 py-1 text-xs text-ink-300 dark:text-ink-600">メモをここへドラッグ</li>
-              )}
-            </ul>
+            {/* 空フォルダでドラッグ中でもない場合は<ul>ごと出さない(無駄な余白を作らない)。
+                「ここにドロップ」ガイドは常時表示せず、実際に何かをドラッグしている間だけ
+                ドロップ可能エリアとして点線枠で示す */}
+            {(!isEmpty || draggingItem) && (
+              <ul className="flex flex-col gap-0.5 py-0.5" style={{ paddingLeft: (depth + 1) * INDENT }}>
+                {notes.map((note) => (
+                  <NoteRow
+                    key={note.id}
+                    note={note}
+                    active={currentNoteId === note.id}
+                    onOpen={() => onOpenNote(note.id)}
+                    onDelete={(e) => onDeleteNote(e, note.id, note.title)}
+                  />
+                ))}
+                {isEmpty && draggingItem && (
+                  <li
+                    className={clsx(
+                      "rounded-lg border-2 border-dashed px-2 py-2 text-center text-xs font-medium",
+                      isDropTarget
+                        ? "border-[#0d0f14]/40 text-[#0d0f14]"
+                        : "border-accent-300 text-accent-500 dark:border-accent-400/50 dark:text-accent-300"
+                    )}
+                  >
+                    ここにドロップ
+                  </li>
+                )}
+              </ul>
+            )}
           </>
         )}
       </div>

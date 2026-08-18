@@ -167,22 +167,32 @@ export function Sidebar({ onNavigate }: SidebarProps) {
             >
               フォルダなし
             </div>
-            <ul className="flex flex-col gap-0.5 py-0.5 pl-1">
-              {unfiledNotes.map((note) => (
-                <NoteRow
-                  key={note.id}
-                  note={note}
-                  active={currentNoteId === note.id}
-                  onOpen={() => openNote(note.id)}
-                  onDelete={(e) => void handleDeleteNote(e, note.id, note.title)}
-                />
-              ))}
-              {unfiledNotes.length === 0 && (
-                <li className="px-2 py-1 text-xs text-ink-300 dark:text-ink-600">
-                  メモをここへドラッグ
-                </li>
-              )}
-            </ul>
+            {(unfiledNotes.length > 0 || draggingItem) && (
+              <ul className="flex flex-col gap-0.5 py-0.5 pl-1">
+                {unfiledNotes.map((note) => (
+                  <NoteRow
+                    key={note.id}
+                    note={note}
+                    active={currentNoteId === note.id}
+                    onOpen={() => openNote(note.id)}
+                    onDelete={(e) => void handleDeleteNote(e, note.id, note.title)}
+                  />
+                ))}
+                {/* 「ここにドロップ」ガイドは常時表示せず、何かをドラッグしている間だけ示す */}
+                {unfiledNotes.length === 0 && draggingItem && (
+                  <li
+                    className={clsx(
+                      "rounded-lg border-2 border-dashed px-2 py-2 text-center text-xs font-medium",
+                      dropTarget === "unfiled"
+                        ? "border-[#0d0f14]/40 text-[#0d0f14]"
+                        : "border-accent-300 text-accent-500 dark:border-accent-400/50 dark:text-accent-300"
+                    )}
+                  >
+                    ここにドロップ
+                  </li>
+                )}
+              </ul>
+            )}
           </div>
         </div>
       </aside>

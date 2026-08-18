@@ -63,6 +63,9 @@ import {
   dbDeleteNote as dbDeleteNoteLocal,
 } from "@/lib/db/indexeddb";
 
+/** メモの既定タイトル。1行目からのタイトル自動抽出は、この値のときだけ発動する */
+const DEFAULT_NOTE_TITLE = "無題のメモ";
+
 /** JSON書き出し/読み込み(データ保護モーダル)で使うスナップショットの形 */
 export interface OutlineSnapshot {
   exportedAt: string;
@@ -343,6 +346,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const localNodes = await dbGetNodesByNote(noteId);
     if (get().currentNoteId === noteId) {
       set({ nodes: toMap(localNodes), loading: false });
+      // 既にコンテンツはあるのにタイトルが「無題のメモ」のまま、という既存データを
+      // 開いたタイミングでも遡ってタイトルを補完する
+      maybeAutoTitleFromFirstNode(noteId, get().nodes);
     }
 
     const client = getSupabaseClient();
@@ -357,6 +363,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
         await dbPutNodes(merged);
         if (get().currentNoteId === noteId) {
           set({ nodes: toMap(merged) });
+          maybeAutoTitleFromFirstNode(noteId, get().nodes);
         }
       } else if (error) {
         devError("[sync] ノードの取得に失敗しました:", error.message);
@@ -377,7 +384,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const now = nowIso();
     const note: NoteData = {
       id: generateId(),
-      title: opts?.title ?? "無題のメモ",
+      title: opts?.title ?? DEFAULT_NOTE_TITLE,
       folderId: opts?.folderId ?? null,
       createdAt: now,
       updatedAt: now,
@@ -524,6 +531,11 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       nodes: { ...s.nodes, [nodeId]: updated },
       selectedNodeIds: s.selectedNodeIds.length > 0 ? [] : s.selectedNodeIds,
     }));
+    // 1行目(先頭のルートノード)を編集した場合は、タイトル未設定のメモに限りタイトルへ反映する
+    const noteId = get().currentNoteId;
+    if (node.parentId === null && noteId) {
+      maybeAutoTitleFromFirstNode(noteId, get().nodes);
+    }
     void persistNode(updated, { debounceMs: 500 });
   },
 
@@ -1217,6 +1229,37 @@ async function safeCall<F extends () => PromiseLike<{ error: { message: string }
       error: { message: err instanceof Error ? err.message : "ネットワークエラーが発生しました" },
     } as Awaited<ReturnType<F>>;
   }
+}
+
+/** ノート内の「1行目」(親を持たないルートノードのうち、positionが最小のもの)を探す */
+function getFirstRootNode(nodes: Record<string, OutlineNodeData>): OutlineNodeData | null {
+  let best: OutlineNodeData | null = null;
+  for (const n of Object.values(nodes)) {
+    if (n.parentId !== null) continue;
+    if (!best || n.position < best.position) best = n;
+  }
+  return best;
+}
+
+/**
+ * メモのタイトルが未設定(空文字)またはデフォルトの「無題のメモ」のままなら、
+ * 1行目(先頭のルートノード)の内容から自動でタイトルを抽出して反映する
+ * (サイドバー・ヘッダーのタイトル一覧が「無題のメモ」だらけになるのを防ぐ)。
+ * ユーザーが一度でも手動でタイトルを変更すると、それ以降タイトルはデフォルト文字列と
+ * 一致しなくなるため、自動追従は自然に止まる(専用のフラグを持たない軽量な設計)。
+ */
+function maybeAutoTitleFromFirstNode(noteId: string, nodes: Record<string, OutlineNodeData>): void {
+  const note = useOutlineStore.getState().notesList.find((n) => n.id === noteId);
+  if (!note) return;
+  if (note.title !== "" && note.title !== DEFAULT_NOTE_TITLE) return;
+
+  const first = getFirstRootNode(nodes);
+  if (!first) return;
+  const plain = htmlToPlainText(first.content).trim().slice(0, 100);
+  const newTitle = plain || DEFAULT_NOTE_TITLE;
+  if (newTitle === note.title) return;
+
+  useOutlineStore.getState().renameNote(noteId, newTitle);
 }
 
 function markSynced(): void {

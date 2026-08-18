@@ -1,6 +1,6 @@
 "use client";
 
-import { Menu } from "lucide-react";
+import { Menu, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
 import { AutosaveIndicator } from "./AutosaveIndicator";
@@ -9,6 +9,8 @@ import { SearchBar } from "./SearchBar";
 
 interface HeaderProps {
   onMenuClick: () => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
 }
 
 /**
@@ -16,7 +18,7 @@ interface HeaderProps {
  * 左右の領域を同じ"1fr"で確保することで、中央の列(タイトル)が実際のコンテンツ幅に
  * 関わらず画面の中央に来るようにしている(左右非対称なナビゲーションでも中央寄せできる定番の手法)。
  */
-export function Header({ onMenuClick }: HeaderProps) {
+export function Header({ onMenuClick, sidebarOpen, onToggleSidebar }: HeaderProps) {
   const currentNoteId = useOutlineStore((s) => s.currentNoteId);
   const notesList = useOutlineStore((s) => s.notesList);
   const renameNote = useOutlineStore((s) => s.renameNote);
@@ -24,9 +26,17 @@ export function Header({ onMenuClick }: HeaderProps) {
 
   return (
     <header className="sticky top-0 z-20 grid grid-cols-[1fr_auto_1fr] items-center gap-x-2 gap-y-1.5 border-b border-ink-100 bg-surface/90 px-3 py-2 backdrop-blur">
-      <div className="flex items-center justify-self-start">
+      <div className="flex items-center gap-0.5 justify-self-start">
         <IconButton label="メニューを開く" onClick={onMenuClick} className="md:hidden">
           <Menu size={18} />
+        </IconButton>
+        {/* サイドバーの折りたたみ(集中モード)。デスクトップのみ表示、Ctrl/Cmd+\でも切替可能 */}
+        <IconButton
+          label={sidebarOpen ? "サイドバーを折りたたむ(Ctrl/Cmd+\\)" : "サイドバーを開く(Ctrl/Cmd+\\)"}
+          onClick={onToggleSidebar}
+          className="hidden md:flex"
+        >
+          {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
         </IconButton>
       </div>
 

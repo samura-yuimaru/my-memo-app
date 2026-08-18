@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronsLeft, ChevronsRight, CornerDownLeft, CornerDownRight } from "lucide-react";
+import { ArrowLeft, ArrowRight } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
@@ -11,7 +11,7 @@ function isEditableElement(el: Element | null): el is HTMLElement {
 }
 
 /**
- * アウトライン操作用のツールバー(≪インデント解除・≫インデント・↲元に戻す・↳やり直す)。
+ * アウトライン操作用のツールバー(←インデント解除・→インデント・←元に戻す・→やり直す)。
  * ソフトウェアキーボードの表示有無に関わらず、常に「同一のコンポーネント・同一のボタン定義・
  * 同一のイベント処理」を描画する一元化された設計にしている(以前はキーボード表示中の
  * 浮遊ツールバーと非表示中の標準操作バーとで、KeyboardToolbar/MobileToolbarという
@@ -85,28 +85,30 @@ export function OutlineToolbar() {
     e.preventDefault();
   }
 
-  const buttons: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }[] = [
+  const indentButtons: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }[] = [
     {
-      label: "インデント解除(親と同じ階層に戻す)",
-      icon: <ChevronsLeft size={19} />,
+      label: "← インデント解除(親と同じ階層に戻す)",
+      icon: <ArrowLeft size={19} />,
       onClick: () => activeNodeId && outdentNode(activeNodeId),
       disabled: noSelection,
     },
     {
-      label: "インデントを下げる(1つ上の子にする)",
-      icon: <ChevronsRight size={19} />,
+      label: "→ インデントを下げる(1つ上の子にする)",
+      icon: <ArrowRight size={19} />,
       onClick: () => activeNodeId && indentNode(activeNodeId),
       disabled: noSelection,
     },
+  ];
+  const historyButtons: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }[] = [
     {
-      label: "元に戻す",
-      icon: <CornerDownLeft size={19} />,
+      label: "← 元に戻す",
+      icon: <ArrowLeft size={19} />,
       onClick: () => undo(),
       disabled: !canUndo,
     },
     {
-      label: "やり直す",
-      icon: <CornerDownRight size={19} />,
+      label: "→ やり直す",
+      icon: <ArrowRight size={19} />,
       onClick: () => redo(),
       disabled: !canRedo,
     },
@@ -124,7 +126,20 @@ export function OutlineToolbar() {
           : { paddingBottom: "max(0.375rem, env(safe-area-inset-bottom))" }
       }
     >
-      {buttons.map((b) => (
+      {indentButtons.map((b) => (
+        <IconButton
+          key={b.label}
+          label={b.label}
+          size="lg"
+          disabled={b.disabled}
+          onPointerDown={preserveFocus}
+          onClick={b.onClick}
+        >
+          {b.icon}
+        </IconButton>
+      ))}
+      <span className="mx-1 h-6 w-px shrink-0 bg-ink-200" aria-hidden="true" />
+      {historyButtons.map((b) => (
         <IconButton
           key={b.label}
           label={b.label}

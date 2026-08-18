@@ -56,12 +56,16 @@ function OutlineNodeComponent({ node, depth, insideSmartBlock = false }: Outline
     deleteNode(node.id);
   }
 
-  // 行頭の6点アイコン(ドラッグハンドル)だけでなく、行全体を長押しすることでも
-  // ドラッグ(階層移動)を開始できるようにする(iPadで小さいアイコンを正確につまむ必要をなくすため)。
-  // 本文の編集(contentEditable)・ボタン・既存のドラッグハンドル上の押下は対象外とし、
-  // 通常のタップでのカーソル配置やテキスト選択と競合しないようにしている。
+  // 行頭の6点アイコン(ドラッグハンドル)だけでなく、本文のテキスト部分を含む行全体を
+  // 長押しすることでもドラッグ(階層移動)を開始できるようにする(iPadで小さいアイコンを
+  // 正確につまむ必要をなくすため)。useLongPressは既定動作をpreventDefaultしないため、
+  // 短いタップはそのまま普段どおりカーソル配置・テキスト編集として通り、長押しと
+  // 判定された場合だけドラッグへ移行する(タップとドラッグが競合しない)。
+  // ボタン・既存のドラッグハンドル上の押下だけは、それぞれ専用の操作があるため対象外にする。
   const rowLongPress = useLongPress({
     onLongPress: ({ pointerId, target }) => {
+      // 長押し判定までの間にネイティブのテキスト選択が始まっていた場合に備えて解除しておく
+      window.getSelection()?.removeAllRanges();
       safeSetPointerCapture(target, pointerId);
       startDrag(node.id);
       setActiveNodeId(node.id);
@@ -69,7 +73,7 @@ function OutlineNodeComponent({ node, depth, insideSmartBlock = false }: Outline
   });
   function handleRowPointerDown(e: React.PointerEvent) {
     const target = e.target as HTMLElement;
-    if (target.closest('button, [contenteditable], [data-drag-handle], a, input')) return;
+    if (target.closest('button, [data-drag-handle], a, input')) return;
     rowLongPress.onPointerDown(e);
   }
 
