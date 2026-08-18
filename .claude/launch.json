@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev",
+      "runtimeExecutable": "C:\\Users\\佐村結丸\\Desktop\\my-memo-app\\dev-with-node.cmd",
+      "runtimeArgs": [],
+      "port": 3000
+    }
+  ]
+}

@@ -1,0 +1,1391 @@
+// ============================================================
+// アプリの中心的な状態管理(Zustand)
+// ・現在開いているメモのノード群をフラットなmapで保持
+// ・すべての変更操作はここに集約し、実行後に
+//   1) 画面即時反映(set) 2) IndexedDBへ即時保存 3) Supabaseへ非同期同期
+//   を必ずこの順で行う。
+// ============================================================
+import { create } from "zustand";
+import type {
+  FolderData,
+  FontSize,
+  NoteData,
+  OutlineNodeData,
+  SmartBlockType,
+  SyncStatus,
+} from "@/types/outline";
+import { generateId } from "@/lib/utils/id";
+import { nowIso } from "@/lib/utils/date";
+import { escapeHtml, htmlToPlainText, splitHtmlAtOffset } from "@/lib/utils/richText";
+import {
+  buildTree,
+  flattenVisible,
+  getNextSibling,
+  getPrevSibling,
+  getSiblings,
+  isSelfOrDescendant,
+  midpointPosition,
+  sequentialPositions,
+} from "@/lib/utils/tree";
+import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
+import { ensureAnonymousSession } from "@/lib/supabase/auth";
+import {
+  folderFromRow,
+  folderToRow,
+  nodeFromRow,
+  nodeToRow,
+  noteFromRow,
+  noteToRow,
+  type NodeRow,
+} from "@/lib/supabase/mappers";
+import {
+  dbAddPendingDelete,
+  dbClearDirty,
+  dbClearPendingDelete,
+  dbDeleteFolder as dbDeleteFolderLocal,
+  dbDeleteNode,
+  dbDeleteNodes,
+  dbGetAllDirty,
+  dbGetAllFolders,
+  dbGetAllNotes,
+  dbGetNode,
+  dbGetNodesByNote,
+  dbGetPendingDeletes,
+  dbMarkDirty,
+  dbPutFolder,
+  dbPutNode,
+  dbPutNodes,
+  dbPutNote,
+  dbDeleteNote as dbDeleteNoteLocal,
+} from "@/lib/db/indexeddb";
+
+export interface FocusRequest {
+  id: string;
+  /** "start"=先頭 / "end"=末尾 / 数値=文字位置 */
+  caret: "start" | "end" | number;
+}
+
+interface OutlineState {
+  initialized: boolean;
+  userId: string | null;
+  isOnline: boolean;
+  supabaseReady: boolean;
+  syncStatus: SyncStatus;
+
+  folders: FolderData[];
+  notesList: NoteData[];
+  currentNoteId: string | null;
+  nodes: Record<string, OutlineNodeData>;
+  loading: boolean;
+
+  activeNodeId: string | null;
+  focusRequest: FocusRequest | null;
+  /** Notion風「2段階Ctrl+A」でのメモ全体選択、およびマウスドラッグでの範囲選択の両方を表す(空配列=通常状態) */
+  selectedNodeIds: string[];
+
+  /** Undo/Redo履歴(開いているメモのnodesスナップショットのスタック) */
+  undoStack: Record<string, OutlineNodeData>[];
+  redoStack: Record<string, OutlineNodeData>[];
+  /** Undo/Redoが起きるたびに増分するカウンタ。フォーカス中のノードでもDOMを強制再同期するために使う */
+  historyVersion: number;
+
+  init: () => Promise<void>;
+  loadNotesList: () => Promise<void>;
+  loadFolders: () => Promise<void>;
+  openNote: (noteId: string) => Promise<void>;
+  createNote: (opts?: { title?: string; folderId?: string | null }) => Promise<string>;
+  renameNote: (noteId: string, title: string) => void;
+  deleteNote: (noteId: string) => Promise<void>;
+  moveNoteToFolder: (noteId: string, folderId: string | null) => void;
+
+  createFolder: (name?: string, parentId?: string | null) => Promise<string>;
+  renameFolder: (folderId: string, name: string) => void;
+  moveFolderTo: (folderId: string, newParentId: string | null) => void;
+  deleteFolder: (folderId: string) => Promise<void>;
+
+  setActiveNodeId: (id: string | null) => void;
+  requestFocus: (req: FocusRequest | null) => void;
+  clearFocusRequest: () => void;
+
+  updateNodeContent: (nodeId: string, content: string) => void;
+  splitNode: (nodeId: string, splitIndex: number) => void;
+  /** 改行を含むテキストの貼り付け: 1行目は現在位置に挿入し、残りは新しい兄弟ノードとして追加する */
+  pasteLines: (nodeId: string, caretOffset: number, lines: string[]) => void;
+  mergeWithPrevious: (nodeId: string) => void;
+  deleteNode: (nodeId: string) => void;
+  /** 複数ノードの一括削除(範囲選択したノード群に対して使う) */
+  deleteNodesBulk: (nodeIds: string[]) => void;
+  indentNode: (nodeId: string, caret?: number) => void;
+  outdentNode: (nodeId: string, caret?: number) => void;
+  /** 複数ノードの一括インデント(表示順で連続する同じ親の並びごとに処理する) */
+  indentNodes: (nodeIds: string[]) => void;
+  /** 複数ノードの一括インデント解除 */
+  outdentNodes: (nodeIds: string[]) => void;
+  moveNodeUp: (nodeId: string) => void;
+  moveNodeDown: (nodeId: string) => void;
+  moveNodeTo: (nodeId: string, newParentId: string | null, newPosition: number) => void;
+  /** 複数ノードのドラッグ&ドロップによる一括移動(相対順序を保ったまま挿入する) */
+  moveNodesTo: (
+    nodeIds: string[],
+    newParentId: string | null,
+    prevPosition: number | undefined,
+    nextPosition: number | undefined
+  ) => void;
+  toggleCollapse: (nodeId: string) => void;
+  setTextColor: (nodeId: string, color: string | null) => void;
+  insertSmartBlock: (nodeId: string, type: SmartBlockType) => string;
+  focusFirstOrCreate: () => void;
+  focusPrevVisible: (nodeId: string) => void;
+  focusNextVisible: (nodeId: string) => void;
+
+  selectAllNodes: () => void;
+  /** anchorIdからoverIdまでを、画面表示順でまとめて範囲選択する(マウスドラッグ選択用) */
+  selectRangeNodes: (anchorId: string, overId: string) => void;
+  clearNodeSelection: () => void;
+
+  undo: () => void;
+  redo: () => void;
+}
+
+function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): OutlineNodeData {
+  const now = nowIso();
+  return {
+    id: partial.id ?? generateId(),
+    noteId: partial.noteId,
+    parentId: partial.parentId ?? null,
+    position: partial.position ?? 0,
+    content: partial.content ?? "",
+    nodeType: partial.nodeType ?? "normal",
+    collapsed: partial.collapsed ?? false,
+    fontSize: partial.fontSize ?? "md",
+    textColor: partial.textColor ?? null,
+    highlightColor: partial.highlightColor ?? null,
+    createdAt: partial.createdAt ?? now,
+    updatedAt: partial.updatedAt ?? now,
+  };
+}
+
+function mergeByUpdatedAt<T extends { id: string; updatedAt: string }>(
+  local: T[],
+  remote: T[]
+): T[] {
+  const map = new Map<string, T>();
+  local.forEach((item) => map.set(item.id, item));
+  remote.forEach((item) => {
+    const existing = map.get(item.id);
+    if (!existing || existing.updatedAt < item.updatedAt) {
+      map.set(item.id, item);
+    }
+  });
+  return Array.from(map.values());
+}
+
+export const useOutlineStore = create<OutlineState>()((set, get) => ({
+  initialized: false,
+  userId: null,
+  isOnline: true,
+  supabaseReady: false,
+  syncStatus: "idle",
+
+  folders: [],
+  notesList: [],
+  currentNoteId: null,
+  nodes: {},
+  loading: false,
+
+  activeNodeId: null,
+  focusRequest: null,
+  selectedNodeIds: [],
+
+  undoStack: [],
+  redoStack: [],
+  historyVersion: 0,
+
+  init: async () => {
+    if (get().initialized) return;
+    set({ initialized: true, supabaseReady: isSupabaseConfigured() });
+
+    if (typeof window !== "undefined") {
+      set({ isOnline: navigator.onLine });
+      window.addEventListener("online", () => {
+        useOutlineStore.setState({ isOnline: true });
+        void flushPendingSync();
+      });
+      window.addEventListener("offline", () => {
+        useOutlineStore.setState({ isOnline: false, syncStatus: "offline" });
+      });
+    }
+
+    const client = getSupabaseClient();
+    if (client) {
+      const session = await ensureAnonymousSession();
+      set({ userId: session?.user.id ?? null });
+    }
+
+    await Promise.all([get().loadFolders(), get().loadNotesList()]);
+    await flushPendingSync();
+  },
+
+  loadFolders: async () => {
+    const local = await dbGetAllFolders();
+    set({ folders: sortFolders(local) });
+
+    const client = getSupabaseClient();
+    const userId = get().userId;
+    if (!client || !userId) return;
+
+    const { data, error } = await client.from("folders").select("*").eq("user_id", userId);
+    if (error) {
+      console.error("[sync] フォルダ一覧の取得に失敗しました:", error.message);
+      return;
+    }
+    const remoteFolders = (data ?? []).map(folderFromRow);
+    const merged = sortFolders(mergeByUpdatedAt(local, remoteFolders));
+    await Promise.all(merged.map((f) => dbPutFolder(f)));
+    set({ folders: merged });
+  },
+
+  loadNotesList: async () => {
+    const local = await dbGetAllNotes();
+    set({ notesList: sortNotes(local) });
+
+    const client = getSupabaseClient();
+    const userId = get().userId;
+    if (!client || !userId) return;
+
+    const { data, error } = await client
+      .from("notes")
+      .select("*")
+      .eq("user_id", userId);
+    if (error) {
+      console.error("[sync] メモ一覧の取得に失敗しました:", error.message);
+      return;
+    }
+    const remoteNotes = (data ?? []).map(noteFromRow);
+    const merged = sortNotes(mergeByUpdatedAt(local, remoteNotes));
+    await Promise.all(merged.map((n) => dbPutNote(n)));
+    set({ notesList: merged });
+  },
+
+  openNote: async (noteId) => {
+    unsubscribeRealtime?.();
+    unsubscribeRealtime = null;
+    set({
+      loading: true,
+      currentNoteId: noteId,
+      nodes: {},
+      activeNodeId: null,
+      undoStack: [],
+      redoStack: [],
+      selectedNodeIds: [],
+    });
+    lastHistoryGroupKey = null;
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("lastOpenedNoteId", noteId);
+    }
+
+    const localNodes = await dbGetNodesByNote(noteId);
+    if (get().currentNoteId === noteId) {
+      set({ nodes: toMap(localNodes), loading: false });
+    }
+
+    const client = getSupabaseClient();
+    const userId = get().userId;
+    if (client && userId) {
+      const { data, error } = await client.from("nodes").select("*").eq("note_id", noteId);
+      if (!error && data) {
+        const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
+        const merged = mergeByUpdatedAt(Object.values(get().nodes), remoteNodes);
+        await dbPutNodes(merged);
+        if (get().currentNoteId === noteId) {
+          set({ nodes: toMap(merged) });
+        }
+      } else if (error) {
+        console.error("[sync] ノードの取得に失敗しました:", error.message);
+      }
+      // 購読を貼る直前でも、その間に別のメモへ遷移していないか再確認する
+      // (遅いレスポンスが新しいメモの購読を横取りしないようにするため)
+      if (get().currentNoteId === noteId) {
+        unsubscribeRealtime = subscribeRealtime(noteId);
+      }
+    }
+
+    if (get().currentNoteId === noteId) {
+      get().focusFirstOrCreate();
+    }
+  },
+
+  createNote: async (opts) => {
+    const now = nowIso();
+    const note: NoteData = {
+      id: generateId(),
+      title: opts?.title ?? "無題のメモ",
+      folderId: opts?.folderId ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const seed = makeNode({ noteId: note.id, position: 0 });
+
+    await dbPutNote(note);
+    await dbPutNode(seed);
+    set((s) => ({ notesList: sortNotes([note, ...s.notesList]) }));
+
+    void persistNote(note);
+    void persistNode(seed);
+
+    return note.id;
+  },
+
+  renameNote: (noteId, title) => {
+    const note = get().notesList.find((n) => n.id === noteId);
+    if (!note) return;
+    const updated: NoteData = { ...note, title, updatedAt: nowIso() };
+    set((s) => ({
+      notesList: sortNotes(s.notesList.map((n) => (n.id === noteId ? updated : n))),
+    }));
+    void persistNote(updated, { debounceMs: 500 });
+  },
+
+  deleteNote: async (noteId) => {
+    const wasCurrent = get().currentNoteId === noteId;
+    const nodesOfNote = wasCurrent ? Object.values(get().nodes) : await dbGetNodesByNote(noteId);
+    const nodeIds = nodesOfNote.map((n) => n.id);
+
+    set((s) => ({
+      notesList: s.notesList.filter((n) => n.id !== noteId),
+      ...(wasCurrent ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
+    }));
+
+    // 削除したメモが今開いていたメモの場合のみ、そのリアルタイム購読を解除する
+    // (別のメモを削除しただけで、今開いているメモの購読を巻き込んで切らないようにする)
+    if (wasCurrent) {
+      unsubscribeRealtime?.();
+      unsubscribeRealtime = null;
+    }
+
+    await persistDeleteNoteFull(noteId, nodeIds);
+  },
+
+  moveNoteToFolder: (noteId, folderId) => {
+    const note = get().notesList.find((n) => n.id === noteId);
+    if (!note) return;
+    const updated: NoteData = { ...note, folderId, updatedAt: nowIso() };
+    set((s) => ({
+      notesList: sortNotes(s.notesList.map((n) => (n.id === noteId ? updated : n))),
+    }));
+    void persistNote(updated);
+  },
+
+  createFolder: async (name, parentId) => {
+    const now = nowIso();
+    const parent = parentId ?? null;
+    const siblings = get().folders.filter((f) => f.parentId === parent);
+    const folder: FolderData = {
+      id: generateId(),
+      name: name ?? "新しいフォルダ",
+      parentId: parent,
+      position: midpointPosition(siblings[siblings.length - 1]?.position, undefined),
+      createdAt: now,
+      updatedAt: now,
+    };
+    await dbPutFolder(folder);
+    set((s) => ({ folders: sortFolders([...s.folders, folder]) }));
+    void persistFolder(folder);
+    return folder.id;
+  },
+
+  renameFolder: (folderId, name) => {
+    const folder = get().folders.find((f) => f.id === folderId);
+    if (!folder) return;
+    const updated: FolderData = { ...folder, name, updatedAt: nowIso() };
+    set((s) => ({
+      folders: sortFolders(s.folders.map((f) => (f.id === folderId ? updated : f))),
+    }));
+    void persistFolder(updated, { debounceMs: 500 });
+  },
+
+  moveFolderTo: (folderId, newParentId) => {
+    const state = get();
+    const folder = state.folders.find((f) => f.id === folderId);
+    if (!folder) return;
+    if (newParentId === folderId) return; // 自分自身の中には入れられない
+    if (newParentId && isFolderSelfOrDescendant(state.folders, folderId, newParentId)) return; // 循環防止
+    if (folder.parentId === newParentId) return; // 変化なし
+
+    const siblings = state.folders.filter((f) => f.parentId === newParentId && f.id !== folderId);
+    const updated: FolderData = {
+      ...folder,
+      parentId: newParentId,
+      position: midpointPosition(siblings[siblings.length - 1]?.position, undefined),
+      updatedAt: nowIso(),
+    };
+    set((s) => ({ folders: sortFolders(s.folders.map((f) => (f.id === folderId ? updated : f))) }));
+    void persistFolder(updated);
+  },
+
+  deleteFolder: async (folderId) => {
+    const allFolders = get().folders;
+    const toDelete: string[] = [];
+    const collect = (id: string) => {
+      toDelete.push(id);
+      allFolders.filter((f) => f.parentId === id).forEach((f) => collect(f.id));
+    };
+    collect(folderId);
+    const toDeleteSet = new Set(toDelete);
+
+    // フォルダ(配下のサブフォルダ含む)を消してもメモ自体は残す(未分類に戻すだけ)
+    const affectedNotes = get().notesList.filter(
+      (n) => n.folderId && toDeleteSet.has(n.folderId)
+    );
+    set((s) => ({
+      folders: s.folders.filter((f) => !toDeleteSet.has(f.id)),
+      notesList: s.notesList.map((n) =>
+        n.folderId && toDeleteSet.has(n.folderId)
+          ? { ...n, folderId: null, updatedAt: nowIso() }
+          : n
+      ),
+    }));
+    await Promise.all(
+      affectedNotes.map((n) => persistNote({ ...n, folderId: null, updatedAt: nowIso() }))
+    );
+    await persistDeleteFolderFull(folderId, toDelete);
+  },
+
+  setActiveNodeId: (id) =>
+    set((s) => ({ activeNodeId: id, selectedNodeIds: s.selectedNodeIds.length > 0 ? [] : s.selectedNodeIds })),
+  requestFocus: (req) => set({ focusRequest: req, activeNodeId: req?.id ?? get().activeNodeId }),
+  clearFocusRequest: () => set({ focusRequest: null }),
+
+  updateNodeContent: (nodeId, content) => {
+    const node = get().nodes[nodeId];
+    if (!node) return;
+    // 同じノードへの連続した入力(通常のタイピング)は1つのUndoステップにまとめる
+    pushHistorySnapshot(`content:${nodeId}`);
+    const updated: OutlineNodeData = { ...node, content, updatedAt: nowIso() };
+    set((s) => ({
+      nodes: { ...s.nodes, [nodeId]: updated },
+      selectedNodeIds: s.selectedNodeIds.length > 0 ? [] : s.selectedNodeIds,
+    }));
+    void persistNode(updated, { debounceMs: 500 });
+  },
+
+  splitNode: (nodeId, splitIndex) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node || !state.currentNoteId) return;
+    pushHistorySnapshot(null);
+    const allNodes = Object.values(state.nodes);
+
+    const [before, after] = splitHtmlAtOffset(node.content, splitIndex);
+    const updatedCurrent: OutlineNodeData = { ...node, content: before, updatedAt: nowIso() };
+
+    // 子の有無やトグルの開閉に関わらず、Enterでの分割は常に同じ階層の「次の兄弟」として
+    // 挿入する(子を持つ行で改行すると勝手にインデントが下がる、という挙動を避けるため)
+    const nextSibling = getNextSibling(allNodes, node);
+    const newNode: OutlineNodeData = makeNode({
+      noteId: state.currentNoteId,
+      parentId: node.parentId,
+      position: midpointPosition(node.position, nextSibling?.position),
+      content: after,
+    });
+
+    set((s) => ({
+      nodes: { ...s.nodes, [nodeId]: updatedCurrent, [newNode.id]: newNode },
+      focusRequest: { id: newNode.id, caret: "start" },
+    }));
+    void persistNode(updatedCurrent, { debounceMs: 500 });
+    void persistNode(newNode);
+  },
+
+  pasteLines: (nodeId, caretOffset, lines) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node || !state.currentNoteId || lines.length === 0) return;
+    pushHistorySnapshot(null);
+
+    const [before, after] = splitHtmlAtOffset(node.content, caretOffset);
+    const escapedLines = lines.map(escapeHtml);
+    const updatedCurrent: OutlineNodeData = {
+      ...node,
+      content: before + escapedLines[0],
+      updatedAt: nowIso(),
+    };
+
+    const allNodes = Object.values(state.nodes);
+    const nextSibling = getNextSibling(allNodes, node);
+    const newNodes: OutlineNodeData[] = [];
+    let prevPosition = node.position;
+    for (let i = 1; i < escapedLines.length; i++) {
+      const isLast = i === escapedLines.length - 1;
+      const pos = midpointPosition(prevPosition, nextSibling?.position);
+      const n = makeNode({
+        noteId: state.currentNoteId,
+        parentId: node.parentId,
+        position: pos,
+        content: isLast ? escapedLines[i] + after : escapedLines[i],
+      });
+      newNodes.push(n);
+      prevPosition = pos;
+    }
+
+    const lastLinePlainLength = lines[lines.length - 1].length;
+    const focusTarget: FocusRequest =
+      newNodes.length > 0
+        ? { id: newNodes[newNodes.length - 1].id, caret: lastLinePlainLength }
+        : { id: nodeId, caret: caretOffset + lines[0].length };
+
+    set((s) => {
+      const next = { ...s.nodes, [nodeId]: updatedCurrent };
+      newNodes.forEach((n) => {
+        next[n.id] = n;
+      });
+      return { nodes: next, focusRequest: focusTarget };
+    });
+    void persistNode(updatedCurrent, { debounceMs: 500 });
+    newNodes.forEach((n) => void persistNode(n));
+  },
+
+  mergeWithPrevious: (nodeId) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node) return;
+    const allNodes = Object.values(state.nodes);
+    const hasChildren = allNodes.some((n) => n.parentId === node.id);
+    if (hasChildren) return;
+
+    const flat = flattenVisible(buildTree(allNodes));
+    const idx = flat.findIndex((n) => n.id === nodeId);
+    const prev = idx > 0 ? flat[idx - 1] : undefined;
+    if (!prev) return;
+    pushHistorySnapshot(null);
+
+    const caretPos = htmlToPlainText(prev.content).length;
+    const updatedPrev: OutlineNodeData = {
+      ...state.nodes[prev.id],
+      content: prev.content + node.content,
+      updatedAt: nowIso(),
+    };
+
+    set((s) => {
+      const next = { ...s.nodes };
+      delete next[nodeId];
+      next[prev.id] = updatedPrev;
+      return { nodes: next, focusRequest: { id: prev.id, caret: caretPos } };
+    });
+    void persistNode(updatedPrev, { debounceMs: 500 });
+    void persistDeleteNodes([nodeId], node.noteId);
+  },
+
+  deleteNode: (nodeId) => {
+    const state = get();
+    if (!state.currentNoteId) return;
+    pushHistorySnapshot(null);
+    const allNodes = Object.values(state.nodes);
+
+    const toDelete: string[] = [];
+    const collect = (id: string) => {
+      toDelete.push(id);
+      allNodes.filter((n) => n.parentId === id).forEach((c) => collect(c.id));
+    };
+    collect(nodeId);
+    const toDeleteSet = new Set(toDelete);
+
+    const flat = flattenVisible(buildTree(allNodes));
+    const idx = flat.findIndex((n) => n.id === nodeId);
+    const before = idx > 0 ? flat[idx - 1] : undefined;
+    const after = flat.slice(idx + 1).find((n) => !toDeleteSet.has(n.id));
+    const focusTarget = before ?? after;
+
+    let seed: OutlineNodeData | null = null;
+    set((s) => {
+      const next = { ...s.nodes };
+      toDelete.forEach((id) => delete next[id]);
+      if (Object.keys(next).length === 0) {
+        seed = makeNode({ noteId: state.currentNoteId as string, position: 0 });
+        next[seed.id] = seed;
+      }
+      return {
+        nodes: next,
+        focusRequest: seed
+          ? { id: seed.id, caret: "start" }
+          : focusTarget
+          ? { id: focusTarget.id, caret: "end" }
+          : null,
+      };
+    });
+
+    void persistDeleteNodes(toDelete, state.currentNoteId);
+    if (seed) void persistNode(seed);
+  },
+
+  deleteNodesBulk: (nodeIds) => {
+    const state = get();
+    if (!state.currentNoteId || nodeIds.length === 0) return;
+    pushHistorySnapshot(null);
+    const allNodes = Object.values(state.nodes);
+
+    const toDelete: string[] = [];
+    const collect = (id: string) => {
+      if (toDelete.includes(id)) return;
+      toDelete.push(id);
+      allNodes.filter((n) => n.parentId === id).forEach((c) => collect(c.id));
+    };
+    nodeIds.forEach(collect);
+
+    let seed: OutlineNodeData | null = null;
+    set((s) => {
+      const next = { ...s.nodes };
+      toDelete.forEach((id) => delete next[id]);
+      if (Object.keys(next).length === 0) {
+        seed = makeNode({ noteId: state.currentNoteId as string, position: 0 });
+        next[seed.id] = seed;
+      }
+      return {
+        nodes: next,
+        selectedNodeIds: [],
+        focusRequest: seed ? { id: seed.id, caret: "start" } : null,
+      };
+    });
+
+    void persistDeleteNodes(toDelete, state.currentNoteId);
+    if (seed) void persistNode(seed);
+  },
+
+  indentNode: (nodeId, caret) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node) return;
+    const allNodes = Object.values(state.nodes);
+    const prevSibling = getPrevSibling(allNodes, node);
+    if (!prevSibling) return;
+    pushHistorySnapshot(null);
+
+    const futureSiblings = getSiblings(allNodes, prevSibling.id);
+    const lastChild = futureSiblings[futureSiblings.length - 1];
+    const updated: OutlineNodeData = {
+      ...node,
+      parentId: prevSibling.id,
+      position: midpointPosition(lastChild?.position, undefined),
+      updatedAt: nowIso(),
+    };
+
+    set((s) => {
+      const next = { ...s.nodes, [nodeId]: updated };
+      if (prevSibling.collapsed) {
+        next[prevSibling.id] = { ...prevSibling, collapsed: false, updatedAt: nowIso() };
+      }
+      // 親をまたぐ移動はReactにとって「別ツリー位置への再マウント」になり、
+      // 何もしないとテキストエリアがフォーカスを失ってしまう。再マウント後に
+      // 同じキャレット位置へフォーカスを戻すよう要求しておく。
+      return { nodes: next, focusRequest: { id: nodeId, caret: caret ?? "end" } };
+    });
+    void persistNode(updated);
+    if (prevSibling.collapsed) {
+      void persistNode({ ...prevSibling, collapsed: false, updatedAt: nowIso() });
+    }
+  },
+
+  outdentNode: (nodeId, caret) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node || !node.parentId) return;
+    const parent = state.nodes[node.parentId];
+    if (!parent) return;
+    pushHistorySnapshot(null);
+    const allNodes = Object.values(state.nodes);
+    const parentNextSibling = getNextSibling(allNodes, parent);
+
+    const updated: OutlineNodeData = {
+      ...node,
+      parentId: parent.parentId,
+      position: midpointPosition(parent.position, parentNextSibling?.position),
+      updatedAt: nowIso(),
+    };
+    // indentNodeと同様、親が変わるとDOMが再マウントされフォーカスが失われるため復元要求を出す
+    set((s) => ({
+      nodes: { ...s.nodes, [nodeId]: updated },
+      focusRequest: { id: nodeId, caret: caret ?? "end" },
+    }));
+    void persistNode(updated);
+  },
+
+  indentNodes: (nodeIds) => {
+    const state = get();
+    if (nodeIds.length === 0) return;
+    const allNodes = Object.values(state.nodes);
+    const flat = flattenVisible(buildTree(allNodes));
+    const selectedSet = new Set(nodeIds);
+    // 選択ノードを表示順に並べ、「同じ親を持つ連続した並び」ごとにグループ化して処理する
+    const ordered = flat.filter((n) => selectedSet.has(n.id));
+    const groups: OutlineNodeData[][] = [];
+    for (const n of ordered) {
+      const last = groups[groups.length - 1];
+      if (last && last[last.length - 1].parentId === n.parentId) last.push(n);
+      else groups.push([n]);
+    }
+
+    const updates: OutlineNodeData[] = [];
+    const collapsedFixes: OutlineNodeData[] = [];
+    for (const group of groups) {
+      const first = group[0];
+      const prevSibling = getPrevSibling(allNodes, first);
+      if (!prevSibling || selectedSet.has(prevSibling.id)) continue; // インデントできない(先頭グループ等)
+      const futureSiblings = getSiblings(allNodes, prevSibling.id);
+      let cursor = futureSiblings[futureSiblings.length - 1]?.position;
+      for (const n of group) {
+        const pos = midpointPosition(cursor, undefined);
+        updates.push({ ...n, parentId: prevSibling.id, position: pos, updatedAt: nowIso() });
+        cursor = pos;
+      }
+      if (prevSibling.collapsed) {
+        collapsedFixes.push({ ...prevSibling, collapsed: false, updatedAt: nowIso() });
+      }
+    }
+    if (updates.length === 0) return;
+    pushHistorySnapshot(null);
+    set((s) => {
+      const next = { ...s.nodes };
+      updates.forEach((u) => (next[u.id] = u));
+      collapsedFixes.forEach((c) => (next[c.id] = c));
+      return { nodes: next };
+    });
+    updates.forEach((u) => void persistNode(u));
+    collapsedFixes.forEach((c) => void persistNode(c));
+  },
+
+  outdentNodes: (nodeIds) => {
+    const state = get();
+    if (nodeIds.length === 0) return;
+    const allNodes = Object.values(state.nodes);
+    const flat = flattenVisible(buildTree(allNodes));
+    const selectedSet = new Set(nodeIds);
+    const ordered = flat.filter((n) => selectedSet.has(n.id));
+    const groups: OutlineNodeData[][] = [];
+    for (const n of ordered) {
+      const last = groups[groups.length - 1];
+      if (last && last[last.length - 1].parentId === n.parentId) last.push(n);
+      else groups.push([n]);
+    }
+
+    const updates: OutlineNodeData[] = [];
+    for (const group of groups) {
+      const first = group[0];
+      if (!first.parentId) continue; // 既に最上位
+      const parent = state.nodes[first.parentId];
+      if (!parent) continue;
+      const parentNextSibling = getNextSibling(allNodes, parent);
+      let cursor: number | undefined = parent.position;
+      for (const n of group) {
+        const pos = midpointPosition(cursor, parentNextSibling?.position);
+        updates.push({ ...n, parentId: parent.parentId, position: pos, updatedAt: nowIso() });
+        cursor = pos;
+      }
+    }
+    if (updates.length === 0) return;
+    pushHistorySnapshot(null);
+    set((s) => {
+      const next = { ...s.nodes };
+      updates.forEach((u) => (next[u.id] = u));
+      return { nodes: next };
+    });
+    updates.forEach((u) => void persistNode(u));
+  },
+
+  moveNodeUp: (nodeId) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node) return;
+    const siblings = getSiblings(Object.values(state.nodes), node.parentId);
+    const idx = siblings.findIndex((s) => s.id === nodeId);
+    if (idx <= 0) return;
+    pushHistorySnapshot(null);
+    const target = siblings[idx - 1];
+    const before = siblings[idx - 2];
+    const updated: OutlineNodeData = {
+      ...node,
+      position: midpointPosition(before?.position, target.position),
+      updatedAt: nowIso(),
+    };
+    set((s) => ({ nodes: { ...s.nodes, [nodeId]: updated } }));
+    void persistNode(updated);
+  },
+
+  moveNodeDown: (nodeId) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node) return;
+    const siblings = getSiblings(Object.values(state.nodes), node.parentId);
+    const idx = siblings.findIndex((s) => s.id === nodeId);
+    if (idx === -1 || idx >= siblings.length - 1) return;
+    pushHistorySnapshot(null);
+    const target = siblings[idx + 1];
+    const after = siblings[idx + 2];
+    const updated: OutlineNodeData = {
+      ...node,
+      position: midpointPosition(target.position, after?.position),
+      updatedAt: nowIso(),
+    };
+    set((s) => ({ nodes: { ...s.nodes, [nodeId]: updated } }));
+    void persistNode(updated);
+  },
+
+  moveNodeTo: (nodeId, newParentId, newPosition) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node) return;
+    const allNodes = Object.values(state.nodes);
+    if (newParentId && isSelfOrDescendant(allNodes, nodeId, newParentId)) return;
+    pushHistorySnapshot(null);
+    const updated: OutlineNodeData = {
+      ...node,
+      parentId: newParentId,
+      position: newPosition,
+      updatedAt: nowIso(),
+    };
+    set((s) => ({ nodes: { ...s.nodes, [nodeId]: updated } }));
+    void persistNode(updated);
+  },
+
+  moveNodesTo: (nodeIds, newParentId, prevPosition, nextPosition) => {
+    const state = get();
+    if (nodeIds.length === 0) return;
+    const allNodes = Object.values(state.nodes);
+    if (newParentId && nodeIds.some((id) => isSelfOrDescendant(allNodes, id, newParentId))) return;
+    const flat = flattenVisible(buildTree(allNodes));
+    const selectedSet = new Set(nodeIds);
+    const ordered = flat.filter((n) => selectedSet.has(n.id));
+    if (ordered.length === 0) return;
+    pushHistorySnapshot(null);
+    const positions = sequentialPositions(prevPosition, nextPosition, ordered.length);
+    const updates = ordered.map((n, i) => ({
+      ...n,
+      parentId: newParentId,
+      position: positions[i],
+      updatedAt: nowIso(),
+    }));
+    set((s) => {
+      const next = { ...s.nodes };
+      updates.forEach((u) => (next[u.id] = u));
+      return { nodes: next };
+    });
+    updates.forEach((u) => void persistNode(u));
+  },
+
+  toggleCollapse: (nodeId) => {
+    const node = get().nodes[nodeId];
+    if (!node) return;
+    const updated: OutlineNodeData = { ...node, collapsed: !node.collapsed, updatedAt: nowIso() };
+    set((s) => ({ nodes: { ...s.nodes, [nodeId]: updated } }));
+    void persistNode(updated);
+  },
+
+  setTextColor: (nodeId, color) => {
+    const node = get().nodes[nodeId];
+    if (!node) return;
+    pushHistorySnapshot(null);
+    const updated: OutlineNodeData = { ...node, textColor: color, updatedAt: nowIso() };
+    set((s) => ({ nodes: { ...s.nodes, [nodeId]: updated } }));
+    void persistNode(updated);
+  },
+
+  insertSmartBlock: (nodeId, type) => {
+    const state = get();
+    const node = state.nodes[nodeId];
+    if (!node || !state.currentNoteId) return "";
+    pushHistorySnapshot(null);
+    // 子として1段深く差し込むのではなく、同じ階層の「次の兄弟」として挿入する。
+    // (通常のノードと全く同じ扱いになるため、トグル折りたたみ・箇条書き表示も
+    //  他のノードと同様にそのまま使える)
+    const allNodes = Object.values(state.nodes);
+    const nextSibling = getNextSibling(allNodes, node);
+    const newNode = makeNode({
+      noteId: state.currentNoteId,
+      parentId: node.parentId,
+      position: midpointPosition(node.position, nextSibling?.position),
+      nodeType: type,
+    });
+
+    set((s) => ({
+      nodes: { ...s.nodes, [newNode.id]: newNode },
+      focusRequest: { id: newNode.id, caret: "start" },
+    }));
+    void persistNode(newNode);
+    return newNode.id;
+  },
+
+  focusFirstOrCreate: () => {
+    const state = get();
+    if (!state.currentNoteId) return;
+    const flat = flattenVisible(buildTree(Object.values(state.nodes)));
+    if (flat.length > 0) {
+      set({ focusRequest: { id: flat[0].id, caret: "start" } });
+    }
+  },
+
+  focusPrevVisible: (nodeId) => {
+    const flat = flattenVisible(buildTree(Object.values(get().nodes)));
+    const idx = flat.findIndex((n) => n.id === nodeId);
+    if (idx > 0) {
+      set({ focusRequest: { id: flat[idx - 1].id, caret: "end" }, activeNodeId: flat[idx - 1].id });
+    }
+  },
+
+  focusNextVisible: (nodeId) => {
+    const flat = flattenVisible(buildTree(Object.values(get().nodes)));
+    const idx = flat.findIndex((n) => n.id === nodeId);
+    if (idx !== -1 && idx < flat.length - 1) {
+      set({ focusRequest: { id: flat[idx + 1].id, caret: "start" }, activeNodeId: flat[idx + 1].id });
+    }
+  },
+
+  selectAllNodes: () => {
+    const flat = flattenVisible(buildTree(Object.values(get().nodes)));
+    set({ selectedNodeIds: flat.map((n) => n.id) });
+  },
+  selectRangeNodes: (anchorId, overId) => {
+    const flat = flattenVisible(buildTree(Object.values(get().nodes)));
+    const ai = flat.findIndex((n) => n.id === anchorId);
+    const oi = flat.findIndex((n) => n.id === overId);
+    if (ai === -1 || oi === -1) return;
+    const [lo, hi] = ai <= oi ? [ai, oi] : [oi, ai];
+    set({ selectedNodeIds: flat.slice(lo, hi + 1).map((n) => n.id) });
+  },
+  clearNodeSelection: () => set({ selectedNodeIds: [] }),
+
+  undo: () => {
+    const state = get();
+    if (state.undoStack.length === 0) return;
+    const prevSnapshot = state.undoStack[state.undoStack.length - 1];
+    const currentSnapshot = state.nodes;
+    lastHistoryGroupKey = null; // 直後の入力を新しいUndoグループとして扱う
+    set({
+      nodes: prevSnapshot,
+      undoStack: state.undoStack.slice(0, -1),
+      redoStack: [...state.redoStack, currentSnapshot].slice(-HISTORY_LIMIT),
+      selectedNodeIds: [],
+      focusRequest: null,
+      historyVersion: state.historyVersion + 1,
+    });
+    void persistSnapshotDiff(currentSnapshot, prevSnapshot);
+  },
+  redo: () => {
+    const state = get();
+    if (state.redoStack.length === 0) return;
+    const nextSnapshot = state.redoStack[state.redoStack.length - 1];
+    const currentSnapshot = state.nodes;
+    lastHistoryGroupKey = null;
+    set({
+      nodes: nextSnapshot,
+      redoStack: state.redoStack.slice(0, -1),
+      undoStack: [...state.undoStack, currentSnapshot].slice(-HISTORY_LIMIT),
+      selectedNodeIds: [],
+      focusRequest: null,
+      historyVersion: state.historyVersion + 1,
+    });
+    void persistSnapshotDiff(currentSnapshot, nextSnapshot);
+  },
+}));
+
+// ============================================================
+// 永続化・同期処理(Supabase / IndexedDB)
+// ストアのactionsから呼ばれるが、循環参照を避けるためストア定義の外側に置く。
+// ============================================================
+
+let unsubscribeRealtime: (() => void) | null = null;
+const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ============================================================
+// Undo/Redo履歴
+// nodesスナップショット(mapまるごと)をスタックに積む簡易実装。個々の操作ごとに
+// 逆操作を書く代わりにスナップショット差分で十分な粒度・確実性が得られるため、
+// この方式を採用している。同じノードへの連続入力(通常のタイピング)は
+// groupKeyが同じ間は1ステップにまとめ、Undoが「1文字ごと」にならないようにする。
+// ============================================================
+const HISTORY_LIMIT = 100;
+const HISTORY_GROUP_WINDOW_MS = 1200;
+let lastHistoryGroupKey: string | null = null;
+let lastHistoryPushAt = 0;
+
+/** 変更を加える直前に呼び、直前の状態をUndoスタックへ積む(Redoスタックはクリアする) */
+function pushHistorySnapshot(groupKey: string | null): void {
+  const state = useOutlineStore.getState();
+  const now = Date.now();
+  const sameGroup =
+    groupKey !== null && groupKey === lastHistoryGroupKey && now - lastHistoryPushAt < HISTORY_GROUP_WINDOW_MS;
+  lastHistoryGroupKey = groupKey;
+  lastHistoryPushAt = now;
+  if (sameGroup) return;
+  const nextStack = [...state.undoStack, state.nodes].slice(-HISTORY_LIMIT);
+  useOutlineStore.setState({ undoStack: nextStack, redoStack: [] });
+}
+
+/** Undo/Redoでnodesマップを丸ごと差し替えた際、実際に変化した分だけをIndexedDB/Supabaseへ反映する */
+async function persistSnapshotDiff(
+  before: Record<string, OutlineNodeData>,
+  after: Record<string, OutlineNodeData>
+): Promise<void> {
+  const changedOrNew: OutlineNodeData[] = [];
+  const removedIds: string[] = [];
+  for (const id of Object.keys(after)) {
+    if (before[id] !== after[id]) changedOrNew.push(after[id]);
+  }
+  for (const id of Object.keys(before)) {
+    if (!(id in after)) removedIds.push(id);
+  }
+  for (const n of changedOrNew) await persistNode(n);
+  if (removedIds.length > 0) {
+    await persistDeleteNodes(removedIds, useOutlineStore.getState().currentNoteId);
+  }
+}
+
+function toMap(nodes: OutlineNodeData[]): Record<string, OutlineNodeData> {
+  const map: Record<string, OutlineNodeData> = {};
+  nodes.forEach((n) => (map[n.id] = n));
+  return map;
+}
+
+function sortNotes(notes: NoteData[]): NoteData[] {
+  return [...notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function sortFolders(folders: FolderData[]): FolderData[] {
+  return [...folders].sort((a, b) => a.position - b.position);
+}
+
+/** targetIdがancestorIdの子孫(またはancestorId自身)かどうか(フォルダの循環移動防止に使う) */
+function isFolderSelfOrDescendant(
+  folders: FolderData[],
+  ancestorId: string,
+  targetId: string
+): boolean {
+  if (ancestorId === targetId) return true;
+  let current = folders.find((f) => f.id === targetId);
+  while (current?.parentId) {
+    if (current.parentId === ancestorId) return true;
+    current = folders.find((f) => f.id === current!.parentId);
+  }
+  return false;
+}
+
+const noteTouchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * ノード編集のたびに、所属するメモの更新日時をローカルの一覧上でも更新する
+ * (サイドバーの「最近編集した順」を成立させるため)。頻繁な書き込みを避けるため軽くデバウンスする。
+ * Supabaseへは他の変更のついでに同期されるため、ここでは送らない。
+ */
+function touchNoteTimestamp(noteId: string): void {
+  const existing = noteTouchTimers.get(noteId);
+  if (existing) clearTimeout(existing);
+  noteTouchTimers.set(
+    noteId,
+    setTimeout(() => {
+      noteTouchTimers.delete(noteId);
+      const state = useOutlineStore.getState();
+      const note = state.notesList.find((n) => n.id === noteId);
+      if (!note) return;
+      const updated: NoteData = { ...note, updatedAt: nowIso() };
+      useOutlineStore.setState({
+        notesList: sortNotes(state.notesList.map((n) => (n.id === noteId ? updated : n))),
+      });
+      void dbPutNote(updated);
+    }, 1500)
+  );
+}
+
+async function persistNode(
+  node: OutlineNodeData,
+  options?: { debounceMs?: number }
+): Promise<void> {
+  touchNoteTimestamp(node.noteId);
+  await dbPutNode(node);
+
+  const client = getSupabaseClient();
+  if (!client) {
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+
+  const push = async () => {
+    const { userId } = useOutlineStore.getState();
+    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+      await dbMarkDirty("nodes", node.id);
+      useOutlineStore.setState({ syncStatus: "offline" });
+      return;
+    }
+    const { error } = await client.from("nodes").upsert(nodeToRow(node, userId));
+    if (error) {
+      console.error("[sync] ノードの保存に失敗しました:", error.message);
+      await dbMarkDirty("nodes", node.id);
+      useOutlineStore.setState({ syncStatus: "error" });
+    } else {
+      await dbClearDirty("nodes", node.id);
+      useOutlineStore.setState({ syncStatus: "saved" });
+    }
+  };
+
+  if (options?.debounceMs) {
+    useOutlineStore.setState({ syncStatus: "saving" });
+    const key = `node:${node.id}`;
+    const existing = debounceTimers.get(key);
+    if (existing) clearTimeout(existing);
+    debounceTimers.set(
+      key,
+      setTimeout(() => {
+        debounceTimers.delete(key);
+        void push();
+      }, options.debounceMs)
+    );
+  } else {
+    useOutlineStore.setState({ syncStatus: "saving" });
+    await push();
+  }
+}
+
+async function persistDeleteNodes(ids: string[], noteId?: string | null): Promise<void> {
+  if (ids.length === 0) return;
+  if (noteId) touchNoteTimestamp(noteId);
+  await dbDeleteNodes(ids);
+
+  const client = getSupabaseClient();
+  if (!client) {
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await Promise.all(ids.map((id) => dbAddPendingDelete("nodes", id)));
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+  // 複数件まとめて削除する場合も、渡されたid全件をリモートから消す(先頭1件だけの削除だと
+  // 残りが同期時に復活してしまうため)
+  const { error } = await client.from("nodes").delete().in("id", ids);
+  if (error) {
+    console.error("[sync] ノードの削除に失敗しました:", error.message);
+    await Promise.all(ids.map((id) => dbAddPendingDelete("nodes", id)));
+    useOutlineStore.setState({ syncStatus: "error" });
+  } else {
+    useOutlineStore.setState({ syncStatus: "saved" });
+  }
+}
+
+async function persistNote(
+  note: NoteData,
+  options?: { debounceMs?: number }
+): Promise<void> {
+  await dbPutNote(note);
+
+  const client = getSupabaseClient();
+  if (!client) {
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+
+  const push = async () => {
+    const { userId } = useOutlineStore.getState();
+    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+      await dbMarkDirty("notes", note.id);
+      useOutlineStore.setState({ syncStatus: "offline" });
+      return;
+    }
+    const { error } = await client.from("notes").upsert(noteToRow(note, userId));
+    if (error) {
+      console.error("[sync] メモの保存に失敗しました:", error.message);
+      await dbMarkDirty("notes", note.id);
+      useOutlineStore.setState({ syncStatus: "error" });
+    } else {
+      await dbClearDirty("notes", note.id);
+      useOutlineStore.setState({ syncStatus: "saved" });
+    }
+  };
+
+  if (options?.debounceMs) {
+    const key = `note:${note.id}`;
+    const existing = debounceTimers.get(key);
+    if (existing) clearTimeout(existing);
+    debounceTimers.set(
+      key,
+      setTimeout(() => {
+        debounceTimers.delete(key);
+        void push();
+      }, options.debounceMs)
+    );
+  } else {
+    await push();
+  }
+}
+
+async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise<void> {
+  await dbDeleteNodes(nodeIds);
+  await dbDeleteNoteLocal(noteId);
+
+  const client = getSupabaseClient();
+  if (!client) return;
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await dbAddPendingDelete("notes", noteId);
+    return;
+  }
+  const { error } = await client.from("notes").delete().eq("id", noteId);
+  if (error) {
+    console.error("[sync] メモの削除に失敗しました:", error.message);
+    await dbAddPendingDelete("notes", noteId);
+  }
+}
+
+async function persistFolder(
+  folder: FolderData,
+  options?: { debounceMs?: number }
+): Promise<void> {
+  await dbPutFolder(folder);
+
+  const client = getSupabaseClient();
+  if (!client) {
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+
+  const push = async () => {
+    const { userId } = useOutlineStore.getState();
+    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+      await dbMarkDirty("folders", folder.id);
+      useOutlineStore.setState({ syncStatus: "offline" });
+      return;
+    }
+    const { error } = await client.from("folders").upsert(folderToRow(folder, userId));
+    if (error) {
+      console.error("[sync] フォルダの保存に失敗しました:", error.message);
+      await dbMarkDirty("folders", folder.id);
+      useOutlineStore.setState({ syncStatus: "error" });
+    } else {
+      await dbClearDirty("folders", folder.id);
+      useOutlineStore.setState({ syncStatus: "saved" });
+    }
+  };
+
+  if (options?.debounceMs) {
+    const key = `folder:${folder.id}`;
+    const existing = debounceTimers.get(key);
+    if (existing) clearTimeout(existing);
+    debounceTimers.set(
+      key,
+      setTimeout(() => {
+        debounceTimers.delete(key);
+        void push();
+      }, options.debounceMs)
+    );
+  } else {
+    await push();
+  }
+}
+
+/**
+ * フォルダ削除。ローカルは配下フォルダも含めてすべて削除し、
+ * リモートはルートの1件だけ削除要求を送ればFKのon delete cascadeが配下も処理してくれる。
+ */
+async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: string[]): Promise<void> {
+  await Promise.all(allIdsToDeleteLocally.map((id) => dbDeleteFolderLocal(id)));
+
+  const client = getSupabaseClient();
+  if (!client) return;
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await dbAddPendingDelete("folders", folderId);
+    return;
+  }
+  const { error } = await client.from("folders").delete().eq("id", folderId);
+  if (error) {
+    console.error("[sync] フォルダの削除に失敗しました:", error.message);
+    await dbAddPendingDelete("folders", folderId);
+  }
+}
+
+/** オフライン中に溜まった未同期の変更/削除をまとめてSupabaseへ送る */
+export async function flushPendingSync(): Promise<void> {
+  const client = getSupabaseClient();
+  if (!client) return;
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) return;
+
+  const pendingDeletes = await dbGetPendingDeletes();
+  for (const pd of pendingDeletes) {
+    const { error } = await client.from(pd.table).delete().eq("id", pd.recordId);
+    if (!error) await dbClearPendingDelete(pd.key);
+  }
+
+  const dirty = await dbGetAllDirty();
+  for (const d of dirty) {
+    if (d.table === "nodes") {
+      const node = await dbGetNode(d.recordId);
+      if (!node) {
+        await dbClearDirty("nodes", d.recordId);
+        continue;
+      }
+      const { error } = await client.from("nodes").upsert(nodeToRow(node, userId));
+      if (!error) await dbClearDirty("nodes", d.recordId);
+    } else if (d.table === "notes") {
+      const note = (await dbGetAllNotes()).find((n) => n.id === d.recordId);
+      if (!note) {
+        await dbClearDirty("notes", d.recordId);
+        continue;
+      }
+      const { error } = await client.from("notes").upsert(noteToRow(note, userId));
+      if (!error) await dbClearDirty("notes", d.recordId);
+    } else {
+      const folder = (await dbGetAllFolders()).find((f) => f.id === d.recordId);
+      if (!folder) {
+        await dbClearDirty("folders", d.recordId);
+        continue;
+      }
+      const { error } = await client.from("folders").upsert(folderToRow(folder, userId));
+      if (!error) await dbClearDirty("folders", d.recordId);
+    }
+  }
+
+  if (pendingDeletes.length > 0 || dirty.length > 0) {
+    useOutlineStore.setState({ syncStatus: "saved" });
+  }
+}
+
+/** 開いているメモの他端末での変更をリアルタイムに反映する */
+function subscribeRealtime(noteId: string): () => void {
+  const client = getSupabaseClient();
+  if (!client) return () => {};
+
+  const channel = client
+    .channel(`nodes-${noteId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "nodes", filter: `note_id=eq.${noteId}` },
+      (payload) => {
+        const state = useOutlineStore.getState();
+        if (state.currentNoteId !== noteId) return;
+
+        if (payload.eventType === "DELETE") {
+          const oldId = (payload.old as { id: string }).id;
+          useOutlineStore.setState((s) => {
+            if (!(oldId in s.nodes)) return s;
+            const next = { ...s.nodes };
+            delete next[oldId];
+            return { nodes: next };
+          });
+          void dbDeleteNode(oldId);
+          return;
+        }
+
+        const incoming = nodeFromRow(payload.new as NodeRow);
+        const existing = state.nodes[incoming.id];
+        // 自分の書き込みのエコーや古い変更で上書きしないようにする
+        if (existing && existing.updatedAt >= incoming.updatedAt) return;
+
+        useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
+        void dbPutNode(incoming);
+      }
+    )
+    .subscribe();
+
+  return () => {
+    void client.removeChannel(channel);
+  };
+}

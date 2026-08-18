@@ -1,0 +1,220 @@
+"use client";
+
+import { useState } from "react";
+import { ChevronRight, FolderPlus, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
+import clsx from "clsx";
+import { useOutlineStore } from "@/lib/store/useOutlineStore";
+import { IconButton } from "@/components/ui/IconButton";
+import { Popover } from "@/components/ui/Popover";
+import { safeSetPointerCapture } from "@/lib/utils/dnd";
+import { HOVER_REVEAL } from "@/lib/uiClasses";
+import { NoteRow } from "./NoteRow";
+import { useSidebarDnd } from "./SidebarDndContext";
+import type { FolderData, NoteData } from "@/types/outline";
+
+interface FolderNodeProps {
+  folder: FolderData;
+  depth: number;
+  allFolders: FolderData[];
+  notesList: NoteData[];
+  currentNoteId: string | null;
+  onOpenNote: (id: string) => void;
+  onDeleteNote: (e: React.MouseEvent, id: string, title: string) => void;
+  onNewNote: (folderId: string) => void;
+}
+
+const INDENT = 12;
+
+/** フォルダ1件分(見出し + 中のメモ + サブフォルダを再帰的に描画) */
+export function FolderNode({
+  folder,
+  depth,
+  allFolders,
+  notesList,
+  currentNoteId,
+  onOpenNote,
+  onDeleteNote,
+  onNewNote,
+}: FolderNodeProps) {
+  const renameFolder = useOutlineStore((s) => s.renameFolder);
+  const deleteFolder = useOutlineStore((s) => s.deleteFolder);
+  const createFolder = useOutlineStore((s) => s.createFolder);
+  const { draggingItem, dropTarget, startDragFolder } = useSidebarDnd();
+
+  const [collapsed, setCollapsed] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(folder.name);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const childFolders = allFolders
+    .filter((f) => f.parentId === folder.id)
+    .sort((a, b) => a.position - b.position);
+  const notes = notesList.filter((n) => (n.folderId ?? null) === folder.id);
+  const isDropTarget = dropTarget === folder.id;
+  const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
+
+  function startEditing() {
+    setDraft(folder.name);
+    setEditing(true);
+    setMenuOpen(false);
+  }
+
+  function commitRename() {
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== folder.name) renameFolder(folder.id, trimmed);
+    setEditing(false);
+  }
+
+  async function handleDelete() {
+    setMenuOpen(false);
+    const ok = window.confirm(
+      `「${folder.name}」を削除します。サブフォルダも一緒に削除されますが、中のメモは「フォルダなし」に移動します。よろしいですか?`
+    );
+    if (!ok) return;
+    await deleteFolder(folder.id);
+  }
+
+  return (
+    <div className={clsx(isDraggingSelf && "opacity-40")}>
+      <div
+        data-folder-drop={folder.id}
+        className={clsx("rounded-lg", isDropTarget && "bg-accent-100 dark:bg-accent-500/15")}
+        style={{ paddingLeft: depth * INDENT }}
+      >
+        <div
+          className="group/actions flex items-center gap-0.5 rounded-lg px-1 py-1"
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenuOpen(true);
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setCollapsed((v) => !v)}
+            title={collapsed ? "展開する" : "折りたたむ"}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-400 hover:bg-ink-100 dark:hover:bg-ink-700"
+          >
+            <ChevronRight size={14} className={clsx("transition-transform", !collapsed && "rotate-90")} />
+          </button>
+
+          {editing ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitRename();
+                }
+                if (e.key === "Escape") {
+                  setDraft(folder.name);
+                  setEditing(false);
+                }
+              }}
+              className="min-w-0 flex-1 rounded border border-accent-300 bg-surface px-1.5 py-0.5 text-sm text-ink-800 outline-none"
+            />
+          ) : (
+            <button
+              type="button"
+              data-drag-handle="true"
+              onPointerDown={(e) => {
+                safeSetPointerCapture(e.currentTarget, e.pointerId);
+                startDragFolder(folder.id);
+              }}
+              onClick={() => setCollapsed((v) => !v)}
+              title={folder.name}
+              className="flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium text-ink-700 hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700"
+            >
+              <span className="min-w-0 flex-1 truncate">{folder.name}</span>
+            </button>
+          )}
+
+          {/* フォルダの操作は右クリックのコンテキストメニューと、この「…」に集約する
+              (フォルダ名が見切れないよう、常時表示のアイコンは最小限にとどめる) */}
+          <div className="relative shrink-0">
+            <IconButton
+              label="フォルダの操作"
+              size="sm"
+              onClick={() => setMenuOpen((v) => !v)}
+              className={HOVER_REVEAL}
+            >
+              <MoreHorizontal size={14} />
+            </IconButton>
+            <Popover open={menuOpen} onClose={() => setMenuOpen(false)} className="md:right-0 md:top-full md:mt-1 md:w-48">
+              <div className="flex flex-col gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onNewNote(folder.id);
+                  }}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-ink-600 hover:bg-ink-50"
+                >
+                  <Plus size={14} /> このフォルダに新規メモ
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void createFolder(undefined, folder.id);
+                  }}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-ink-600 hover:bg-ink-50"
+                >
+                  <FolderPlus size={14} /> サブフォルダを作成
+                </button>
+                <button
+                  type="button"
+                  onClick={startEditing}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-ink-600 hover:bg-ink-50"
+                >
+                  <Pencil size={14} /> 名前を変更
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDelete()}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-500/10"
+                >
+                  <Trash2 size={14} /> フォルダを削除
+                </button>
+              </div>
+            </Popover>
+          </div>
+        </div>
+
+        {!collapsed && (
+          <>
+            {childFolders.map((child) => (
+              <FolderNode
+                key={child.id}
+                folder={child}
+                depth={depth + 1}
+                allFolders={allFolders}
+                notesList={notesList}
+                currentNoteId={currentNoteId}
+                onOpenNote={onOpenNote}
+                onDeleteNote={onDeleteNote}
+                onNewNote={onNewNote}
+              />
+            ))}
+            <ul className="flex flex-col gap-0.5 py-0.5" style={{ paddingLeft: (depth + 1) * INDENT }}>
+              {notes.map((note) => (
+                <NoteRow
+                  key={note.id}
+                  note={note}
+                  active={currentNoteId === note.id}
+                  onOpen={() => onOpenNote(note.id)}
+                  onDelete={(e) => onDeleteNote(e, note.id, note.title)}
+                />
+              ))}
+              {notes.length === 0 && childFolders.length === 0 && (
+                <li className="px-2 py-1 text-xs text-ink-300 dark:text-ink-600">メモをここへドラッグ</li>
+              )}
+            </ul>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
