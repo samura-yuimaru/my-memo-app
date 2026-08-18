@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronRight, FolderPlus, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
+import { ChevronRight, Folder, FolderPlus, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
@@ -76,15 +76,28 @@ export function FolderNode({
     await deleteFolder(folder.id);
   }
 
-  // フォルダ名を長押し(指を動かさずに離す)すると、その場で名前変更を起動する。
-  // そのまま指を動かした場合はドラッグ(フォルダ移動)に引き継がれる。
+  // フォルダ名の押下は「ドラッグ移動」と「名前変更」がはっきり分かれるようにしている:
+  // ・タッチ/ペン: 長押しでドラッグを開始する(短いタップは折りたたみのトグルのまま)
+  // ・マウス: 長押し不要で、押した瞬間からすぐにドラッグを開始できる(名前変更は
+  //   ダブルクリック/右クリックメニュー/「…」メニューに完全分離しているため、
+  //   1クリック=ドラッグ開始としても誤操作にならない)
+  // 名前変更モードへの移行はダブルクリック・コンテキストメニュー・「…」メニューからのみ行い、
+  // 長押しでは絶対に起動しない(長押し→わずかなブレでドラッグと誤認する、といった
+  // 誤作動を避けるため)。
   const longPress = useLongPress({
     onLongPress: ({ pointerId, target }) => {
       safeSetPointerCapture(target, pointerId);
       startDragFolder(folder.id);
     },
-    onLongPressRelease: startEditing,
   });
+  function handleNamePointerDown(e: React.PointerEvent<HTMLButtonElement>) {
+    if (e.pointerType === "mouse") {
+      safeSetPointerCapture(e.currentTarget, e.pointerId);
+      startDragFolder(folder.id);
+      return;
+    }
+    longPress.onPointerDown(e);
+  }
 
   return (
     <div className={clsx(isDraggingSelf && "opacity-40")}>
@@ -141,8 +154,15 @@ export function FolderNode({
               type="button"
               data-drag-handle="true"
               onContextMenu={(e) => e.preventDefault()}
-              {...longPress}
+              onPointerDown={handleNamePointerDown}
+              onPointerMove={longPress.onPointerMove}
+              onPointerUp={longPress.onPointerUp}
+              onPointerCancel={longPress.onPointerCancel}
               onClick={() => setCollapsed((v) => !v)}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                startEditing();
+              }}
               title={folder.name}
               className={clsx(
                 "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium hover:bg-ink-100 active:cursor-grabbing",
@@ -150,6 +170,7 @@ export function FolderNode({
                 NO_IOS_CALLOUT
               )}
             >
+              <Folder size={14} className="shrink-0 opacity-70" aria-hidden="true" />
               <span className="min-w-0 flex-1 truncate">{folder.name}</span>
             </button>
           )}

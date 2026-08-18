@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { GripVertical, Trash2 } from "lucide-react";
+import { FileText, GripVertical, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
@@ -110,6 +110,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
               active ? SELECTED_TEXT_CLASS : "text-ink-700"
             )}
           >
+            <FileText size={14} className="shrink-0 opacity-70" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{note.title || "無題のメモ"}</span>
           </a>
         )}

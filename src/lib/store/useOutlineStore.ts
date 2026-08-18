@@ -66,6 +66,27 @@ import {
 /** メモの既定タイトル。1行目からのタイトル自動抽出は、この値のときだけ発動する */
 const DEFAULT_NOTE_TITLE = "無題のメモ";
 
+/**
+ * アプリ内コピー&ペーストでツリー構造(親子関係)を保持するためのクリップボードMIMEタイプ。
+ * 標準の"text/plain"と一緒にこの形式も書き込んでおき、アプリ内へ貼り付けるときだけ
+ * こちらを優先して読み取る(他アプリへのペーストは従来どおりプレーンテキストになる)。
+ */
+export const OUTLINER_CLIPBOARD_MIME = "application/x-outliner-nodes";
+
+interface ClipboardNodeItem {
+  id: string;
+  /** 選択範囲内の別ノードを指す場合のみ意味を持つ(範囲外を指していた場合はnull=選択の根っこ) */
+  parentId: string | null;
+  content: string;
+  nodeType: string;
+  textColor: string | null;
+}
+
+interface OutlinerClipboardData {
+  outlinerClipboard: 1;
+  items: ClipboardNodeItem[];
+}
+
 /** JSON書き出し/読み込み(データ保護モーダル)で使うスナップショットの形 */
 export interface OutlineSnapshot {
   exportedAt: string;
@@ -163,6 +184,14 @@ interface OutlineState {
   /** anchorIdからoverIdまでを、画面表示順でまとめて範囲選択する(マウスドラッグ選択用) */
   selectRangeNodes: (anchorId: string, overId: string) => void;
   clearNodeSelection: () => void;
+
+  /** 選択中ノードをツリー構造(親子関係)を保ったままクリップボード用JSONへ書き出す */
+  buildClipboardPayload: (nodeIds: string[]) => string;
+  /**
+   * buildClipboardPayloadで作ったJSONを、指定ノードの直後(同じ階層)に貼り付ける。
+   * 形式が正しくなければ何もせずfalseを返す(呼び出し側はそれ以外の通常ペーストへフォールバックできる)。
+   */
+  pasteClipboardPayload: (payload: string, afterNodeId: string) => boolean;
 
   undo: () => void;
   redo: () => void;
@@ -531,10 +560,13 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       nodes: { ...s.nodes, [nodeId]: updated },
       selectedNodeIds: s.selectedNodeIds.length > 0 ? [] : s.selectedNodeIds,
     }));
-    // 1行目(先頭のルートノード)を編集した場合は、タイトル未設定のメモに限りタイトルへ反映する
+    // 1行目(先頭のルートノード)を編集した場合は、タイトル未設定のメモに限りタイトルへ反映する。
+    // 「編集前」の1行目の内容から導かれるタイトルを渡すことで、1文字目の入力直後に
+    // 自動追従が止まってしまう(タイトルが1文字で固定される)不具合を防ぐ
     const noteId = get().currentNoteId;
     if (node.parentId === null && noteId) {
-      maybeAutoTitleFromFirstNode(noteId, get().nodes);
+      const previousFirstLineTitle = htmlToPlainText(node.content).trim().slice(0, 100) || DEFAULT_NOTE_TITLE;
+      maybeAutoTitleFromFirstNode(noteId, get().nodes, previousFirstLineTitle);
     }
     void persistNode(updated, { debounceMs: 500 });
   },
@@ -1022,6 +1054,87 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   },
   clearNodeSelection: () => set({ selectedNodeIds: [] }),
 
+  buildClipboardPayload: (nodeIds) => {
+    const nodes = get().nodes;
+    const idSet = new Set(nodeIds);
+    const items: ClipboardNodeItem[] = nodeIds
+      .map((id) => nodes[id])
+      .filter((n): n is OutlineNodeData => !!n)
+      .map((n) => ({
+        id: n.id,
+        // 選択範囲外を指す親は「選択の根っこ」として扱う(貼り付け先の階層にそのまま乗せる)
+        parentId: n.parentId && idSet.has(n.parentId) ? n.parentId : null,
+        content: n.content,
+        nodeType: n.nodeType,
+        textColor: n.textColor,
+      }));
+    return JSON.stringify({ outlinerClipboard: 1, items } satisfies OutlinerClipboardData);
+  },
+
+  pasteClipboardPayload: (payload, afterNodeId) => {
+    const state = get();
+    if (!state.currentNoteId) return false;
+
+    let parsed: OutlinerClipboardData | null = null;
+    try {
+      const data = JSON.parse(payload);
+      if (data && data.outlinerClipboard === 1 && Array.isArray(data.items) && data.items.length > 0) {
+        parsed = data as OutlinerClipboardData;
+      }
+    } catch {
+      return false;
+    }
+    if (!parsed) return false;
+
+    const anchor = state.nodes[afterNodeId];
+    if (!anchor) return false;
+
+    pushHistorySnapshot(null);
+    const allNodes = Object.values(state.nodes);
+    const anchorNextSibling = getNextSibling(allNodes, anchor);
+
+    const idMap = new Map<string, string>();
+    parsed.items.forEach((item) => idMap.set(item.id, generateId()));
+
+    let rootCursor: number | undefined = anchor.position;
+    const childCursors = new Map<string, number | undefined>();
+
+    const newNodes: OutlineNodeData[] = parsed.items.map((item) => {
+      const newId = idMap.get(item.id)!;
+      const mappedParentId = item.parentId ? idMap.get(item.parentId) ?? null : null;
+      let position: number;
+      let parentId: string | null;
+      if (mappedParentId === null) {
+        // 選択の「根っこ」だったノード: anchorと同じ階層の兄弟として、anchorの直後に順番に挿入する
+        parentId = anchor.parentId;
+        position = midpointPosition(rootCursor, anchorNextSibling?.position);
+        rootCursor = position;
+      } else {
+        // 選択内の別ノードの子だったノード: 新しい親IDの下で元の相対順序を保って挿入する
+        parentId = mappedParentId;
+        position = midpointPosition(childCursors.get(mappedParentId), undefined);
+        childCursors.set(mappedParentId, position);
+      }
+      return makeNode({
+        id: newId,
+        noteId: state.currentNoteId as string,
+        parentId,
+        position,
+        content: item.content,
+        nodeType: item.nodeType as OutlineNodeData["nodeType"],
+        textColor: item.textColor,
+      });
+    });
+
+    set((s) => {
+      const next = { ...s.nodes };
+      newNodes.forEach((n) => (next[n.id] = n));
+      return { nodes: next, selectedNodeIds: newNodes.map((n) => n.id) };
+    });
+    newNodes.forEach((n) => void persistNode(n));
+    return true;
+  },
+
   undo: () => {
     const state = get();
     if (state.undoStack.length === 0) return;
@@ -1243,15 +1356,26 @@ function getFirstRootNode(nodes: Record<string, OutlineNodeData>): OutlineNodeDa
 
 /**
  * メモのタイトルが未設定(空文字)またはデフォルトの「無題のメモ」のままなら、
- * 1行目(先頭のルートノード)の内容から自動でタイトルを抽出して反映する
+ * 1行目(先頭のルートノード)の「テキスト全体」を自動でタイトルへ反映する
  * (サイドバー・ヘッダーのタイトル一覧が「無題のメモ」だらけになるのを防ぐ)。
- * ユーザーが一度でも手動でタイトルを変更すると、それ以降タイトルはデフォルト文字列と
- * 一致しなくなるため、自動追従は自然に止まる(専用のフラグを持たない軽量な設計)。
+ *
+ * previousFirstLineTitleには、この変更が起きる直前の1行目から導かれるはずだった
+ * タイトル(=直前にauto-titleが追従していたなら一致するはずの値)を渡す。現在のタイトルが
+ * それと一致する(＝まだ自動追従中)場合のみ上書きし、ユーザーが手動で別の文字列に
+ * 変更していた場合は上書きしない。これが無いと、1文字目を入力した直後にタイトルが
+ * デフォルト文字列("無題のメモ"や空文字)と一致しなくなり、2文字目以降まったく
+ * 追従しなくなる(=タイトルが1文字で固定される)バグになる。
  */
-function maybeAutoTitleFromFirstNode(noteId: string, nodes: Record<string, OutlineNodeData>): void {
+function maybeAutoTitleFromFirstNode(
+  noteId: string,
+  nodes: Record<string, OutlineNodeData>,
+  previousFirstLineTitle?: string
+): void {
   const note = useOutlineStore.getState().notesList.find((n) => n.id === noteId);
   if (!note) return;
-  if (note.title !== "" && note.title !== DEFAULT_NOTE_TITLE) return;
+  const wasFollowing =
+    note.title === "" || note.title === DEFAULT_NOTE_TITLE || note.title === previousFirstLineTitle;
+  if (!wasFollowing) return;
 
   const first = getFirstRootNode(nodes);
   if (!first) return;

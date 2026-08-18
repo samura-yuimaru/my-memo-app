@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ArrowLeft, ArrowRight } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
@@ -11,7 +11,7 @@ function isEditableElement(el: Element | null): el is HTMLElement {
 }
 
 /**
- * アウトライン操作用のツールバー(←インデント解除・→インデント・←元に戻す・→やり直す)。
+ * アウトライン操作用のツールバー(≪インデント解除・≫インデント・←元に戻す・→やり直す)。
  * ソフトウェアキーボードの表示有無に関わらず、常に「同一のコンポーネント・同一のボタン定義・
  * 同一のイベント処理」を描画する一元化された設計にしている(以前はキーボード表示中の
  * 浮遊ツールバーと非表示中の標準操作バーとで、KeyboardToolbar/MobileToolbarという
@@ -87,27 +87,27 @@ export function OutlineToolbar() {
 
   const indentButtons: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }[] = [
     {
-      label: "← インデント解除(親と同じ階層に戻す)",
-      icon: <ArrowLeft size={19} />,
+      label: "≪ 段落を1段上げる(インデント解除・Outdent / Shift+Tab)",
+      icon: <ChevronsLeft size={19} />,
       onClick: () => activeNodeId && outdentNode(activeNodeId),
       disabled: noSelection,
     },
     {
-      label: "→ インデントを下げる(1つ上の子にする)",
-      icon: <ArrowRight size={19} />,
+      label: "≫ 段落を1段下げる(インデント・Indent / Tab)",
+      icon: <ChevronsRight size={19} />,
       onClick: () => activeNodeId && indentNode(activeNodeId),
       disabled: noSelection,
     },
   ];
   const historyButtons: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }[] = [
     {
-      label: "← 元に戻す",
+      label: "← 元に戻す(Undo / Ctrl+Z)",
       icon: <ArrowLeft size={19} />,
       onClick: () => undo(),
       disabled: !canUndo,
     },
     {
-      label: "→ やり直す",
+      label: "→ やり直す(Redo / Ctrl+Y, Ctrl+Shift+Z)",
       icon: <ArrowRight size={19} />,
       onClick: () => redo(),
       disabled: !canRedo,

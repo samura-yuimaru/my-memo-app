@@ -91,7 +91,9 @@ function OutlineNodeComponent({ node, depth, insideSmartBlock = false }: Outline
         onPointerCancel={rowLongPress.onPointerCancel}
         className={clsx(
           "group/actions relative flex items-center gap-0.5 rounded-md px-1 py-0.5",
-          isDropTarget && dragOver?.position === "into" && "ring-2 ring-accent-400 bg-accent-50/60 dark:bg-accent-500/10",
+          isDropTarget &&
+            dragOver?.position === "into" &&
+            "bg-accent-50/60 shadow-[inset_2px_0_0_0_#2563eb] dark:bg-accent-500/10 dark:shadow-[inset_2px_0_0_0_#38bdf8]",
           isMultiSelected
             ? clsx(SELECTED_BG_CLASS, SELECTED_TEXT_CLASS)
             : activeNodeId === node.id && "bg-accent-50/60 dark:bg-accent-500/10"
@@ -220,11 +222,21 @@ function IndentGuides({ depth }: { depth: number }) {
   );
 }
 
+/**
+ * ドラッグ中の挿入位置を示す棒線インジケーター。シンプルな水平線+先端のドットのみの
+ * デザインで、深い階層でも領域が膨らんで表示が崩れることがないようにしている。
+ * ライトモードは鮮やかなブルー(#2563EB)、ダークモードは暗い背景でも浮き上がって
+ * 見えるシアン寄りのブルー(#38BDF8)にして、どちらのテーマでもはっきり視認できるようにしている。
+ */
 function DropLine({ depth }: { depth: number }) {
   return (
     <div
-      className="my-0.5 h-0.5 rounded-full bg-accent-400"
+      className="relative my-0.5 h-0.5 shrink-0"
       style={{ marginLeft: depth * INDENT_WIDTH + 8 }}
-    />
+      aria-hidden="true"
+    >
+      <div className="h-full rounded-full bg-[#2563eb] dark:bg-[#38bdf8]" />
+      <span className="absolute left-0 top-1/2 h-[7px] w-[7px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#2563eb] dark:bg-[#38bdf8]" />
+    </div>
   );
 }
