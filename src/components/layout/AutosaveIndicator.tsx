@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Download, Loader2, Upload } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Download, Loader2, RefreshCw, Upload } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { Popover } from "@/components/ui/Popover";
@@ -16,6 +16,9 @@ export function AutosaveIndicator() {
   const syncStatus = useOutlineStore((s) => s.syncStatus);
   const supabaseReady = useOutlineStore((s) => s.supabaseReady);
   const isOnline = useOutlineStore((s) => s.isOnline);
+  const userId = useOutlineStore((s) => s.userId);
+  const reconnecting = useOutlineStore((s) => s.reconnecting);
+  const reconnectSupabase = useOutlineStore((s) => s.reconnectSupabase);
   const lastSyncedAt = useOutlineStore((s) => s.lastSyncedAt);
   const exportSnapshot = useOutlineStore((s) => s.exportSnapshot);
   const importSnapshot = useOutlineStore((s) => s.importSnapshot);
@@ -23,7 +26,12 @@ export function AutosaveIndicator() {
   const [open, setOpen] = useState(false);
   const [importMessage, setImportMessage] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [reconnectMessage, setReconnectMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Supabase自体は設定済みなのに、匿名認証がまだ通っていない(またはエラー状態)の場合に、
+  // ワンタップで再接続できるボタンをモーダル内に出す
+  const showReconnect = supabaseReady && (syncStatus === "error" || !userId);
 
   const view = (() => {
     if (syncStatus === "saving") {
@@ -91,6 +99,12 @@ export function AutosaveIndicator() {
     URL.revokeObjectURL(url);
   }
 
+  async function handleReconnect() {
+    setReconnectMessage(null);
+    const ok = await reconnectSupabase();
+    setReconnectMessage(ok ? "Supabaseに接続しました" : "接続できませんでした。もう一度お試しください");
+  }
+
   function handleImportClick() {
     setImportMessage(null);
     fileInputRef.current?.click();
@@ -140,18 +154,37 @@ export function AutosaveIndicator() {
               {view.icon}
               {view.label}
             </div>
-            <p className="mt-1 text-xs text-ink-500">{view.detail}</p>
+            <p className="mt-1 text-xs text-ink-600">{view.detail}</p>
           </div>
 
-          <div className="rounded-lg bg-ink-50 px-2.5 py-2 text-xs text-ink-600 dark:bg-ink-800">
-            最終同期: <span className="font-medium text-ink-800">{lastSyncedLabel}</span>
+          <div className="rounded-lg bg-ink-100 px-2.5 py-2 text-xs text-ink-600">
+            最終同期: <span className="font-medium text-ink-900">{lastSyncedLabel}</span>
           </div>
+
+          {showReconnect && (
+            <div className="flex flex-col gap-1">
+              <button
+                type="button"
+                disabled={reconnecting}
+                onClick={() => void handleReconnect()}
+                className="flex items-center gap-2 rounded-md bg-accent-500 px-2.5 py-2 text-left text-sm font-medium text-white hover:bg-accent-600 disabled:opacity-60"
+              >
+                {reconnecting ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={15} />
+                )}
+                Supabaseに手動接続/再試行
+              </button>
+              {reconnectMessage && <p className="text-xs text-ink-500">{reconnectMessage}</p>}
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             <button
               type="button"
               onClick={() => void handleExport()}
-              className="flex items-center gap-2 rounded-md border border-ink-200 px-2.5 py-2 text-left text-sm text-ink-700 hover:bg-ink-50 dark:hover:bg-ink-800"
+              className="flex items-center gap-2 rounded-md border border-ink-200 px-2.5 py-2 text-left text-sm text-ink-700 hover:bg-ink-50"
             >
               <Download size={15} /> JSONで書き出す(バックアップ)
             </button>
@@ -159,7 +192,7 @@ export function AutosaveIndicator() {
               type="button"
               disabled={importing}
               onClick={handleImportClick}
-              className="flex items-center gap-2 rounded-md border border-ink-200 px-2.5 py-2 text-left text-sm text-ink-700 hover:bg-ink-50 disabled:opacity-50 dark:hover:bg-ink-800"
+              className="flex items-center gap-2 rounded-md border border-ink-200 px-2.5 py-2 text-left text-sm text-ink-700 hover:bg-ink-50 disabled:opacity-50"
             >
               {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
               JSONを読み込む(復元・引き継ぎ)

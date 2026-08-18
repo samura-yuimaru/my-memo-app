@@ -6,13 +6,15 @@ import { Baseline } from "lucide-react";
 import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
 import { TEXT_COLOR_PALETTE } from "@/lib/nodeStyles";
-import { HOVER_REVEAL } from "@/lib/uiClasses";
+import { actionIconClass } from "@/lib/uiClasses";
 
 export interface ActiveColors {
   textColor: string | null;
 }
 
 interface NodeStylePopoverProps {
+  /** 行が選択中(アクティブ/網掛け)かどうか。falseのときはトリガーアイコン自体を隠す */
+  selected: boolean;
   textColor: string | null;
   /** 選択中のテキストがあれば、その部分に実際に適用されている色を返す(なければnull) */
   getActiveColors: () => ActiveColors | null;
@@ -25,7 +27,7 @@ function preserveSelection(e: React.MouseEvent) {
 }
 
 /** 文字色(黒・赤・青)を変更するポップオーバー */
-export function NodeStylePopover({ textColor, getActiveColors, onTextColor }: NodeStylePopoverProps) {
+export function NodeStylePopover({ selected, textColor, getActiveColors, onTextColor }: NodeStylePopoverProps) {
   const [open, setOpen] = useState(false);
   // ポップオーバーを開いた瞬間の「実際に選択されている色」を表示に反映する
   // (ノード全体の既定色ではなく、選択範囲そのものの色とスウォッチのズレを防ぐため)
@@ -46,7 +48,7 @@ export function NodeStylePopover({ textColor, getActiveColors, onTextColor }: No
         size="sm"
         onMouseDown={preserveSelection}
         onClick={handleToggle}
-        className={HOVER_REVEAL}
+        className={actionIconClass(selected || open)}
       >
         <Baseline size={15} />
       </IconButton>

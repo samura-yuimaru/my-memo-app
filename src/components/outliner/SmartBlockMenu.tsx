@@ -5,15 +5,17 @@ import { Box } from "lucide-react";
 import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
 import { SMART_BLOCKS } from "@/lib/smartBlocks";
-import { HOVER_REVEAL } from "@/lib/uiClasses";
+import { actionIconClass } from "@/lib/uiClasses";
 import type { SmartBlockType } from "@/types/outline";
 
 interface SmartBlockMenuProps {
+  /** 行が選択中(アクティブ/網掛け)かどうか。falseのときはトリガーアイコン自体を隠す */
+  selected: boolean;
   onInsert: (type: SmartBlockType) => void;
 }
 
 /** 「なぜ重要なのか」等、Axios風スマート構造化ブロックを挿入するメニュー */
-export function SmartBlockMenu({ onInsert }: SmartBlockMenuProps) {
+export function SmartBlockMenu({ selected, onInsert }: SmartBlockMenuProps) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -22,7 +24,7 @@ export function SmartBlockMenu({ onInsert }: SmartBlockMenuProps) {
         label="スマート構造化"
         size="sm"
         onClick={() => setOpen((v) => !v)}
-        className={HOVER_REVEAL}
+        className={actionIconClass(selected || open)}
       >
         <Box size={15} />
       </IconButton>

@@ -84,6 +84,8 @@ interface OutlineState {
   syncStatus: SyncStatus;
   /** 直近でSupabaseへの同期に成功した日時(ISO)。データ保護ステータスのモーダルに表示する */
   lastSyncedAt: string | null;
+  /** Supabaseへの(再)接続処理が進行中かどうか。手動再接続ボタンの二重押下防止・スピナー表示に使う */
+  reconnecting: boolean;
 
   folders: FolderData[];
   notesList: NoteData[];
@@ -163,6 +165,13 @@ interface OutlineState {
   exportSnapshot: () => Promise<OutlineSnapshot>;
   /** データ保護モーダルからのJSON読み込み(バックアップの復元・機種変更時の引き継ぎ用) */
   importSnapshot: (data: unknown) => Promise<{ folders: number; notes: number; nodes: number }>;
+
+  /**
+   * Supabaseへの手動再接続(データ保護ステータスのモーダルの「再試行」ボタンから呼ぶ)。
+   * 匿名サインインをやり直し、成功したら同期キューの強制処理・フォルダ/メモ一覧の再取得・
+   * 開いているメモの再購読までまとめて行う。
+   */
+  reconnectSupabase: () => Promise<boolean>;
 }
 
 function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): OutlineNodeData {
@@ -205,6 +214,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   supabaseReady: false,
   syncStatus: "idle",
   lastSyncedAt: null,
+  reconnecting: false,
 
   folders: [],
   notesList: [],
@@ -231,18 +241,18 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       set({ isOnline: navigator.onLine });
       window.addEventListener("online", () => {
         useOutlineStore.setState({ isOnline: true });
-        void flushPendingSync();
+        // オンライン復帰時: まだ認証できていなければ匿名サインインからやり直し、
+        // 既に認証済みならそのまま未送信分をまとめて送る
+        if (!useOutlineStore.getState().userId) void connectSupabase();
+        else void flushPendingSync();
       });
       window.addEventListener("offline", () => {
         useOutlineStore.setState({ isOnline: false, syncStatus: "offline" });
       });
     }
 
-    const client = getSupabaseClient();
-    if (client) {
-      const session = await ensureAnonymousSession();
-      set({ userId: session?.user.id ?? null });
-    }
+    // 起動時: 匿名サインイン(リトライ付き)→ 成功したら即座に未送信分の同期キューを処理する
+    if (getSupabaseClient()) await connectSupabase();
 
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
     await flushPendingSync();
@@ -1007,6 +1017,17 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     void persistSnapshotDiff(currentSnapshot, nextSnapshot);
   },
 
+  reconnectSupabase: async () => {
+    const ok = await connectSupabase();
+    if (ok) {
+      await get().loadFolders();
+      await get().loadNotesList();
+      const noteId = get().currentNoteId;
+      if (noteId) await get().openNote(noteId);
+    }
+    return ok;
+  },
+
   exportSnapshot: async () => {
     const [folders, notes, nodes] = await Promise.all([
       dbGetAllFolders(),
@@ -1132,6 +1153,35 @@ function markSynced(): void {
   const now = nowIso();
   useOutlineStore.setState({ syncStatus: "saved", lastSyncedAt: now });
   void dbSetMeta("lastSyncedAt", now);
+}
+
+/**
+ * Supabaseへの接続(匿名サインイン)を確立し、成功したら未送信分の同期キューを
+ * 即座に処理する。起動時・オンライン復帰時・手動再接続ボタンのすべてから呼ばれる
+ * 共通の入口(二重実行は`reconnecting`フラグで防ぐ)。
+ */
+async function connectSupabase(): Promise<boolean> {
+  const client = getSupabaseClient();
+  if (!client) return false;
+  if (useOutlineStore.getState().reconnecting) return false;
+
+  useOutlineStore.setState({ reconnecting: true });
+  try {
+    const session = await ensureAnonymousSession();
+    const userId = session?.user.id ?? null;
+    useOutlineStore.setState({ userId });
+    if (!userId) {
+      useOutlineStore.setState({
+        syncStatus: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "error",
+      });
+      return false;
+    }
+    await flushPendingSync();
+    markSynced();
+    return true;
+  } finally {
+    useOutlineStore.setState({ reconnecting: false });
+  }
 }
 
 function sortNotes(notes: NoteData[]): NoteData[] {

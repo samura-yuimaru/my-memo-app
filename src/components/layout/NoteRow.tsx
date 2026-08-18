@@ -5,7 +5,7 @@ import { GripVertical, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
-import { actionIconClass, NO_IOS_CALLOUT } from "@/lib/uiClasses";
+import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
 import { useLongPress } from "@/lib/utils/useLongPress";
 import { useSidebarDnd } from "./SidebarDndContext";
@@ -57,7 +57,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
         className={clsx(
           "flex items-center gap-0.5 rounded-lg pr-1",
           isDragging && "opacity-40",
-          active ? "bg-accent-100 dark:bg-accent-500/15" : "hover:bg-ink-100 dark:hover:bg-ink-800"
+          active ? SELECTED_BG_CLASS : "hover:bg-ink-100"
         )}
       >
         <button
@@ -69,7 +69,8 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
           }}
           title="ドラッグしてフォルダへ移動"
           className={clsx(
-            "flex h-7 w-5 shrink-0 cursor-grab touch-none items-center justify-center text-ink-300 active:cursor-grabbing",
+            "flex h-7 w-5 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
+            active ? SELECTED_TEXT_CLASS : "text-ink-300",
             actionIconClass(active)
           )}
         >
@@ -106,7 +107,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
             className={clsx(
               "flex min-w-0 flex-1 touch-none items-center gap-2 rounded-lg py-2 pr-1 text-sm",
               NO_IOS_CALLOUT,
-              active ? "text-accent-800" : "text-ink-700"
+              active ? SELECTED_TEXT_CLASS : "text-ink-700"
             )}
           >
             <span className="min-w-0 flex-1 truncate">{note.title || "無題のメモ"}</span>
@@ -119,6 +120,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
           onClick={onDelete}
           className={clsx(
             "shrink-0 hover:!bg-rose-100 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400",
+            active && SELECTED_TEXT_CLASS,
             actionIconClass(active)
           )}
         >

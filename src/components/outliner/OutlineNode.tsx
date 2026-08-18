@@ -9,7 +9,7 @@ import { htmlToPlainText } from "@/lib/utils/richText";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
 import { useLongPress } from "@/lib/utils/useLongPress";
 import { IconButton } from "@/components/ui/IconButton";
-import { actionIconClass } from "@/lib/uiClasses";
+import { actionIconClass, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { ToggleArrow } from "./ToggleArrow";
 import { NodeEditor, type NodeEditorHandle } from "./NodeEditor";
 import { SmartBlockBadge } from "./SmartBlockBadge";
@@ -89,7 +89,7 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
           "group/actions relative flex items-center gap-0.5 rounded-md px-1 py-0.5",
           isDropTarget && dragOver?.position === "into" && "ring-2 ring-accent-400 bg-accent-50/60 dark:bg-accent-500/10",
           isMultiSelected
-            ? "bg-accent-100 dark:bg-accent-500/20"
+            ? clsx(SELECTED_BG_CLASS, SELECTED_TEXT_CLASS)
             : activeNodeId === node.id && "bg-accent-50/60 dark:bg-accent-500/10"
         )}
         style={{ paddingLeft: depth * INDENT_WIDTH }}
@@ -127,12 +127,14 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
             hasChildren={hasChildren}
             depth={depth}
             insideSmartBlock={insideSmartBlock}
+            selected={isMultiSelected}
           />
         </div>
 
         <div className="ml-1 flex shrink-0 items-center gap-0.5">
-          <SmartBlockMenu onInsert={(type) => insertSmartBlock(node.id, type)} />
+          <SmartBlockMenu selected={isSelected} onInsert={(type) => insertSmartBlock(node.id, type)} />
           <NodeStylePopover
+            selected={isSelected}
             textColor={node.textColor}
             getActiveColors={() => editorRef.current?.getActiveColors() ?? null}
             onTextColor={(v) => {

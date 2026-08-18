@@ -17,6 +17,7 @@ import {
   setCaretOffset,
   splitHtmlAtOffset,
 } from "@/lib/utils/richText";
+import { SELECTED_TEXT_HEX } from "@/lib/uiClasses";
 import type { ActiveColors } from "./NodeStylePopover";
 import type { OutlineNodeData } from "@/types/outline";
 
@@ -26,6 +27,9 @@ interface NodeEditorProps {
   depth: number;
   /** 自身またはいずれかの祖先がスマート構造化ブロックかどうか(フォントサイズを「小」に固定するため) */
   insideSmartBlock: boolean;
+  /** 行が範囲選択(網掛け)中かどうか。trueの間は、ユーザーが選んだ文字色に関わらず
+   *  選択ハイライトの上で確実に読める濃い色を強制表示する */
+  selected?: boolean;
 }
 
 /** 行内装飾ボタン(文字色)から呼び出すための命令的ハンドル */
@@ -61,7 +65,7 @@ function maybeReplaceEllipsis(): void {
  * Enter/Backspace/Tab/矢印キー等アウトライナーの主要キー操作もすべてここで処理する。
  */
 export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function NodeEditor(
-  { node, hasChildren, depth, insideSmartBlock },
+  { node, hasChildren, depth, insideSmartBlock, selected = false },
   ref
 ) {
   const editorRef = useRef<HTMLDivElement>(null);
@@ -389,7 +393,7 @@ export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function
         "empty:before:pointer-events-none empty:before:text-ink-300 empty:before:content-[attr(data-placeholder)]",
         getAutoFontSizeClass(depth, insideSmartBlock)
       )}
-      style={{ color: node.textColor ?? undefined }}
+      style={{ color: selected ? SELECTED_TEXT_HEX : node.textColor ?? undefined }}
     />
   );
 });
