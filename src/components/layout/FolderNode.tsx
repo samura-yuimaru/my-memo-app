@@ -60,6 +60,9 @@ export function FolderNode({
   const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
   const isEmpty = childFolders.length === 0 && notes.length === 0;
   const selected = isSelected("folder", folder.id);
+  // メモ側(NoteRow)の「選択中/開いている」ハイライトと完全に同じ配色ロジックにする。
+  // isDropTargetもドラッグ中のドロップ先案内として同じ配色を流用する。
+  const highlighted = selected || isDropTarget;
 
   function startEditing() {
     setDraft(folder.name);
@@ -151,7 +154,7 @@ export function FolderNode({
         <div
           className={clsx(
             "group/actions flex items-center gap-1 rounded-lg px-1 py-1.5",
-            selected && !isDropTarget && "bg-accent-100 dark:bg-accent-500/15"
+            selected && !isDropTarget && SELECTED_BG_CLASS
           )}
           onContextMenu={(e) => {
             e.preventDefault();
@@ -180,7 +183,7 @@ export function FolderNode({
               title={collapsed ? "展開する" : "折りたたむ"}
               className={clsx(
                 "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100",
-                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
+                highlighted ? SELECTED_TEXT_CLASS : "text-ink-400"
               )}
             >
               <ChevronRight size={16} className={clsx("transition-transform", !collapsed && "rotate-90")} />
@@ -223,7 +226,7 @@ export function FolderNode({
               title={folder.name}
               className={clsx(
                 "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-base font-medium hover:bg-ink-100 active:cursor-grabbing",
-                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700",
+                highlighted ? SELECTED_TEXT_CLASS : "text-ink-700",
                 NO_IOS_CALLOUT
               )}
             >
@@ -239,7 +242,7 @@ export function FolderNode({
               label="フォルダの操作"
               size="sm"
               onClick={() => setMenuOpen((v) => !v)}
-              className={actionIconClass(menuOpen || editing)}
+              className={clsx(highlighted && SELECTED_TEXT_CLASS, actionIconClass(menuOpen || editing || highlighted))}
             >
               <MoreHorizontal size={16} />
             </IconButton>

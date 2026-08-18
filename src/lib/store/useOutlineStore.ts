@@ -287,7 +287,13 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
   init: async () => {
     if (get().initialized) return;
-    set({ initialized: true, supabaseReady: isSupabaseConfigured() });
+    console.log("[Sync] 初期化を開始します");
+    const supabaseReady = isSupabaseConfigured();
+    set({ initialized: true, supabaseReady });
+    console.log(
+      "[Sync] Supabase設定状態:",
+      supabaseReady ? "設定済み(クラウド同期を試みます)" : "未設定(端末のみのローカル専用モード)"
+    );
 
     const savedSyncedAt = await dbGetMeta<string>("lastSyncedAt");
     if (savedSyncedAt) set({ lastSyncedAt: savedSyncedAt });
@@ -295,6 +301,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     if (typeof window !== "undefined") {
       set({ isOnline: navigator.onLine });
       window.addEventListener("online", () => {
+        console.log("[Sync] オンラインに復帰しました");
         useOutlineStore.setState({ isOnline: true });
         // オンライン復帰時: まだ認証できていなければ匿名サインインからやり直し、
         // 既に認証済みならそのまま未送信分をまとめて送る
@@ -302,6 +309,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
         else void flushPendingSync();
       });
       window.addEventListener("offline", () => {
+        console.log("[Sync] オフラインになりました");
         useOutlineStore.setState({ isOnline: false, syncStatus: "offline" });
       });
     }
@@ -312,6 +320,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       // 再認証を試みる、安全な再接続フロー。SupabaseのSDKがトークン更新も自動で
       // 行うが(autoRefreshToken)、それでも失われた場合の最終防御線としてここで検知する。
       client.auth.onAuthStateChange((event, session) => {
+        console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
           useOutlineStore.setState({ userId: null });
           void connectSupabase();
@@ -324,10 +333,16 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     }
 
     // 起動時: 匿名サインイン(リトライ付き)→ 成功したら即座に未送信分の同期キューを処理する
-    if (client) await connectSupabase();
+    if (client) {
+      console.log("[Sync] Supabaseへの接続(匿名認証)を開始します");
+      await connectSupabase();
+    }
 
+    console.log("[Sync] フォルダ/メモ一覧の読み込みを開始します");
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
+    console.log("[Sync] 未送信分の同期キューのフラッシュを開始します");
     await flushPendingSync();
+    console.log("[Sync] 初期化が完了しました。syncStatus=", get().syncStatus, "userId=", get().userId);
   },
 
   loadFolders: async () => {
@@ -1410,14 +1425,33 @@ function toMap(nodes: OutlineNodeData[]): Record<string, OutlineNodeData> {
  * 同じエラーハンドリング(dirty化・再送キュー登録・syncStatus更新)を通るようにし、
  * ネットワーク瞬断時にローカルの変更が黙って失われる(=再送キューに載らない)ことを防ぐ。
  */
+/**
+ * Supabaseへの通信がネットワークの都合等で例外もエラーも返さないままいつまでも
+ * 応答しない場合に備えたタイムアウト。これが無いと、fetchが宙に浮いたままawaitし
+ * 続けることになり、コンソールには何のエラーも出ないのに同期状態(syncStatus)が
+ * "saving"のまま永遠に遷移しない、という診断しづらい停滞を招く。
+ */
+const SUPABASE_CALL_TIMEOUT_MS = 10000;
+
 async function safeCall<F extends () => PromiseLike<{ error: { message: string } | null }>>(
   fn: F
 ): Promise<Awaited<ReturnType<F>>> {
   try {
-    return (await fn()) as Awaited<ReturnType<F>>;
+    const result = await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Supabaseへの通信がタイムアウトしました")),
+          SUPABASE_CALL_TIMEOUT_MS
+        )
+      ),
+    ]);
+    return result as Awaited<ReturnType<F>>;
   } catch (err) {
+    const message = err instanceof Error ? err.message : "ネットワークエラーが発生しました";
+    console.log("[Sync] Supabaseへの通信が失敗/タイムアウトしました:", message);
     return {
-      error: { message: err instanceof Error ? err.message : "ネットワークエラーが発生しました" },
+      error: { message },
     } as Awaited<ReturnType<F>>;
   }
 }
@@ -1466,6 +1500,7 @@ function maybeAutoTitleFromFirstNode(
 
 function markSynced(): void {
   const now = nowIso();
+  console.log("[Sync] クラウド同期済み(Supabase)にステータスを更新します", now);
   useOutlineStore.setState({ syncStatus: "saved", lastSyncedAt: now });
   void dbSetMeta("lastSyncedAt", now);
   void refreshPendingCount();
@@ -1488,27 +1523,41 @@ async function refreshPendingCount(): Promise<void> {
  */
 async function connectSupabase(): Promise<boolean> {
   const client = getSupabaseClient();
-  if (!client) return false;
-  if (useOutlineStore.getState().reconnecting) return false;
+  if (!client) {
+    console.log("[Sync] Supabaseクライアントが無いため接続処理をスキップします(ローカル専用モード)");
+    return false;
+  }
+  if (useOutlineStore.getState().reconnecting) {
+    console.log("[Sync] 接続処理が既に進行中のため、今回の呼び出しはスキップします");
+    return false;
+  }
 
+  console.log("[Sync] Supabaseへの接続確認(匿名認証)を開始します");
   useOutlineStore.setState({ reconnecting: true });
   try {
     const session = await ensureAnonymousSession();
     const userId = session?.user.id ?? null;
     useOutlineStore.setState({ userId });
     if (!userId) {
+      console.log("[Sync] 匿名認証が完了しなかったため、クラウド同期済みにはできません");
       useOutlineStore.setState({
         syncStatus: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "error",
       });
       return false;
     }
+    console.log("[Sync] 匿名認証が完了しました。未送信分の同期キューを処理します userId=", userId);
     await flushPendingSync();
+    console.log("[Sync] Supabaseとの接続・認証が確定しました。ステータスを更新します");
     markSynced();
     return true;
   } catch (err) {
     // IndexedDBの一時的な失敗等、予期しない例外が起きてもクラッシュさせず
     // エラー状態として扱う(呼び出し元は再接続ボタンで再試行できる)
     devError("[supabase] 接続処理で予期しないエラーが発生しました:", err instanceof Error ? err.message : err);
+    console.log(
+      "[Sync] 接続処理で予期しないエラーが発生しました:",
+      err instanceof Error ? err.message : err
+    );
     useOutlineStore.setState({ syncStatus: "error" });
     return false;
   } finally {
@@ -1778,15 +1827,24 @@ export async function flushPendingSync(): Promise<void> {
   const client = getSupabaseClient();
   if (!client) return;
   const { userId } = useOutlineStore.getState();
-  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) return;
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    console.log("[Sync] 未認証またはオフラインのため、同期キューのフラッシュを見送ります");
+    return;
+  }
 
   const pendingDeletes = await dbGetPendingDeletes();
+  console.log(
+    "[Sync] 同期キューのフラッシュ開始: 未送信削除",
+    pendingDeletes.length,
+    "件"
+  );
   for (const pd of pendingDeletes) {
     const { error } = await safeCall(() => client.from(pd.table).delete().eq("id", pd.recordId));
     if (!error) await dbClearPendingDelete(pd.key);
   }
 
   const dirty = await dbGetAllDirty();
+  console.log("[Sync] 同期キューのフラッシュ: 未送信の変更", dirty.length, "件");
   for (const d of dirty) {
     if (d.table === "nodes") {
       const node = await dbGetNode(d.recordId);
@@ -1817,6 +1875,8 @@ export async function flushPendingSync(): Promise<void> {
 
   if (pendingDeletes.length > 0 || dirty.length > 0) {
     markSynced();
+  } else {
+    console.log("[Sync] 同期キューは空でした(送信対象なし)");
   }
 }
 
