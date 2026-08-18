@@ -7,8 +7,9 @@ import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { countDescendants } from "@/lib/utils/tree";
 import { htmlToPlainText } from "@/lib/utils/richText";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
+import { useLongPress } from "@/lib/utils/useLongPress";
 import { IconButton } from "@/components/ui/IconButton";
-import { HOVER_REVEAL } from "@/lib/uiClasses";
+import { actionIconClass } from "@/lib/uiClasses";
 import { ToggleArrow } from "./ToggleArrow";
 import { NodeEditor, type NodeEditorHandle } from "./NodeEditor";
 import { SmartBlockBadge } from "./SmartBlockBadge";
@@ -55,12 +56,35 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
     deleteNode(node.id);
   }
 
+  // 行頭の6点アイコン(ドラッグハンドル)だけでなく、行全体を長押しすることでも
+  // ドラッグ(階層移動)を開始できるようにする(iPadで小さいアイコンを正確につまむ必要をなくすため)。
+  // 本文の編集(contentEditable)・ボタン・既存のドラッグハンドル上の押下は対象外とし、
+  // 通常のタップでのカーソル配置やテキスト選択と競合しないようにしている。
+  const rowLongPress = useLongPress({
+    onLongPress: ({ pointerId, target }) => {
+      safeSetPointerCapture(target, pointerId);
+      startDrag(node.id);
+      setActiveNodeId(node.id);
+    },
+  });
+  function handleRowPointerDown(e: React.PointerEvent) {
+    const target = e.target as HTMLElement;
+    if (target.closest('button, [contenteditable], [data-drag-handle], a, input')) return;
+    rowLongPress.onPointerDown(e);
+  }
+
+  const isSelected = isMultiSelected || activeNodeId === node.id;
+
   return (
     <div>
       {isDropTarget && dragOver?.position === "before" && <DropLine depth={depth} />}
 
       <div
         data-node-id={node.id}
+        onPointerDown={handleRowPointerDown}
+        onPointerMove={rowLongPress.onPointerMove}
+        onPointerUp={rowLongPress.onPointerUp}
+        onPointerCancel={rowLongPress.onPointerCancel}
         className={clsx(
           "group/actions relative flex items-center gap-0.5 rounded-md px-1 py-0.5",
           isDropTarget && dragOver?.position === "into" && "ring-2 ring-accent-400 bg-accent-50/60 dark:bg-accent-500/10",
@@ -120,7 +144,7 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
             label="このノードを削除"
             size="sm"
             onClick={handleDelete}
-            className={clsx(HOVER_REVEAL, "hover:!bg-rose-50 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400")}
+            className={clsx(actionIconClass(isSelected), "hover:!bg-rose-50 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400")}
           >
             <Trash2 size={14} />
           </IconButton>

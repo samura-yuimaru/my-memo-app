@@ -47,7 +47,9 @@ import {
   dbDeleteNodes,
   dbGetAllDirty,
   dbGetAllFolders,
+  dbGetAllNodes,
   dbGetAllNotes,
+  dbGetMeta,
   dbGetNode,
   dbGetNodesByNote,
   dbGetPendingDeletes,
@@ -56,8 +58,17 @@ import {
   dbPutNode,
   dbPutNodes,
   dbPutNote,
+  dbSetMeta,
   dbDeleteNote as dbDeleteNoteLocal,
 } from "@/lib/db/indexeddb";
+
+/** JSON書き出し/読み込み(データ保護モーダル)で使うスナップショットの形 */
+export interface OutlineSnapshot {
+  exportedAt: string;
+  folders: FolderData[];
+  notes: NoteData[];
+  nodes: OutlineNodeData[];
+}
 
 export interface FocusRequest {
   id: string;
@@ -71,6 +82,8 @@ interface OutlineState {
   isOnline: boolean;
   supabaseReady: boolean;
   syncStatus: SyncStatus;
+  /** 直近でSupabaseへの同期に成功した日時(ISO)。データ保護ステータスのモーダルに表示する */
+  lastSyncedAt: string | null;
 
   folders: FolderData[];
   notesList: NoteData[];
@@ -145,6 +158,11 @@ interface OutlineState {
 
   undo: () => void;
   redo: () => void;
+
+  /** データ保護モーダルからのJSON書き出し(端末内の全フォルダ・全メモ・全ノード) */
+  exportSnapshot: () => Promise<OutlineSnapshot>;
+  /** データ保護モーダルからのJSON読み込み(バックアップの復元・機種変更時の引き継ぎ用) */
+  importSnapshot: (data: unknown) => Promise<{ folders: number; notes: number; nodes: number }>;
 }
 
 function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): OutlineNodeData {
@@ -186,6 +204,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   isOnline: true,
   supabaseReady: false,
   syncStatus: "idle",
+  lastSyncedAt: null,
 
   folders: [],
   notesList: [],
@@ -204,6 +223,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   init: async () => {
     if (get().initialized) return;
     set({ initialized: true, supabaseReady: isSupabaseConfigured() });
+
+    const savedSyncedAt = await dbGetMeta<string>("lastSyncedAt");
+    if (savedSyncedAt) set({ lastSyncedAt: savedSyncedAt });
 
     if (typeof window !== "undefined") {
       set({ isOnline: navigator.onLine });
@@ -984,7 +1006,64 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     });
     void persistSnapshotDiff(currentSnapshot, nextSnapshot);
   },
+
+  exportSnapshot: async () => {
+    const [folders, notes, nodes] = await Promise.all([
+      dbGetAllFolders(),
+      dbGetAllNotes(),
+      dbGetAllNodes(),
+    ]);
+    return { exportedAt: nowIso(), folders, notes, nodes };
+  },
+
+  importSnapshot: async (data) => {
+    const snapshot = parseOutlineSnapshot(data);
+    // フォルダ → メモ → ノードの順で書き込む(親子関係(parentId/folderId)の参照先が
+    // 先に存在している状態にするため。IndexedDB/Supabaseどちらも外部キー的な
+    // 整合性チェックがあるため、この順序を守る)
+    for (const f of snapshot.folders) await persistFolder(f);
+    for (const n of snapshot.notes) await persistNote(n);
+    for (const nd of snapshot.nodes) await persistNode(nd);
+
+    await get().loadFolders();
+    await get().loadNotesList();
+    const currentNoteId = get().currentNoteId;
+    if (currentNoteId) {
+      const localNodes = await dbGetNodesByNote(currentNoteId);
+      set({ nodes: toMap(localNodes) });
+    }
+
+    return {
+      folders: snapshot.folders.length,
+      notes: snapshot.notes.length,
+      nodes: snapshot.nodes.length,
+    };
+  },
 }));
+
+/** importSnapshotの入力を検証し、最低限の形が揃っているスナップショットへ整形する */
+function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
+  if (!data || typeof data !== "object") {
+    throw new Error("JSONの形式が正しくありません");
+  }
+  const obj = data as Record<string, unknown>;
+  const folders = Array.isArray(obj.folders) ? (obj.folders as FolderData[]) : [];
+  const notes = Array.isArray(obj.notes) ? (obj.notes as NoteData[]) : [];
+  const nodes = Array.isArray(obj.nodes) ? (obj.nodes as OutlineNodeData[]) : [];
+  const isValidRecord = (r: unknown): r is { id: string } =>
+    !!r && typeof r === "object" && typeof (r as { id?: unknown }).id === "string";
+  if (
+    !folders.every(isValidRecord) ||
+    !notes.every(isValidRecord) ||
+    !nodes.every(isValidRecord)
+  ) {
+    throw new Error("JSONの中身がこのアプリの書き出し形式と一致しません");
+  }
+  if (folders.length === 0 && notes.length === 0 && nodes.length === 0) {
+    throw new Error("読み込めるデータがありませんでした");
+  }
+  return { exportedAt: typeof obj.exportedAt === "string" ? obj.exportedAt : nowIso(), folders, notes, nodes };
+}
 
 // ============================================================
 // 永続化・同期処理(Supabase / IndexedDB)
@@ -1042,6 +1121,17 @@ function toMap(nodes: OutlineNodeData[]): Record<string, OutlineNodeData> {
   const map: Record<string, OutlineNodeData> = {};
   nodes.forEach((n) => (map[n.id] = n));
   return map;
+}
+
+/**
+ * Supabaseへの同期成功を記録する。syncStatusを"saved"にするのに加えて、
+ * データ保護ステータスのモーダルに表示する「最終同期日時」も更新・永続化する
+ * (頻繁に呼ばれるためIndexedDBへの書き込みは投げっぱなしにし、待ち合わせない)
+ */
+function markSynced(): void {
+  const now = nowIso();
+  useOutlineStore.setState({ syncStatus: "saved", lastSyncedAt: now });
+  void dbSetMeta("lastSyncedAt", now);
 }
 
 function sortNotes(notes: NoteData[]): NoteData[] {
@@ -1120,7 +1210,7 @@ async function persistNode(
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
       await dbClearDirty("nodes", node.id);
-      useOutlineStore.setState({ syncStatus: "saved" });
+      markSynced();
     }
   };
 
@@ -1166,7 +1256,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
     await Promise.all(ids.map((id) => dbAddPendingDelete("nodes", id)));
     useOutlineStore.setState({ syncStatus: "error" });
   } else {
-    useOutlineStore.setState({ syncStatus: "saved" });
+    markSynced();
   }
 }
 
@@ -1196,7 +1286,7 @@ async function persistNote(
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
       await dbClearDirty("notes", note.id);
-      useOutlineStore.setState({ syncStatus: "saved" });
+      markSynced();
     }
   };
 
@@ -1260,7 +1350,7 @@ async function persistFolder(
       useOutlineStore.setState({ syncStatus: "error" });
     } else {
       await dbClearDirty("folders", folder.id);
-      useOutlineStore.setState({ syncStatus: "saved" });
+      markSynced();
     }
   };
 
@@ -1344,7 +1434,7 @@ export async function flushPendingSync(): Promise<void> {
   }
 
   if (pendingDeletes.length > 0 || dirty.length > 0) {
-    useOutlineStore.setState({ syncStatus: "saved" });
+    markSynced();
   }
 }
 

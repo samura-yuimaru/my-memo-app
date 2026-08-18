@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { FilePlus2, FolderPlus } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
+import { BrandHeader } from "./BrandHeader";
 import { FolderNode } from "./FolderNode";
 import { NoteRow } from "./NoteRow";
 import { SidebarDndContext, type SidebarDragItem } from "./SidebarDndContext";
@@ -112,6 +113,8 @@ export function Sidebar({ onNavigate }: SidebarProps) {
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
       >
+        <BrandHeader />
+
         <div className="flex flex-col gap-2 p-3">
           <button
             type="button"

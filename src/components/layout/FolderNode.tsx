@@ -7,7 +7,8 @@ import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
-import { HOVER_REVEAL } from "@/lib/uiClasses";
+import { useLongPress } from "@/lib/utils/useLongPress";
+import { actionIconClass, NO_IOS_CALLOUT } from "@/lib/uiClasses";
 import { NoteRow } from "./NoteRow";
 import { useSidebarDnd } from "./SidebarDndContext";
 import type { FolderData, NoteData } from "@/types/outline";
@@ -74,6 +75,16 @@ export function FolderNode({
     await deleteFolder(folder.id);
   }
 
+  // フォルダ名を長押し(指を動かさずに離す)すると、その場で名前変更を起動する。
+  // そのまま指を動かした場合はドラッグ(フォルダ移動)に引き継がれる。
+  const longPress = useLongPress({
+    onLongPress: ({ pointerId, target }) => {
+      safeSetPointerCapture(target, pointerId);
+      startDragFolder(folder.id);
+    },
+    onLongPressRelease: startEditing,
+  });
+
   return (
     <div className={clsx(isDraggingSelf && "opacity-40")}>
       <div
@@ -119,13 +130,14 @@ export function FolderNode({
             <button
               type="button"
               data-drag-handle="true"
-              onPointerDown={(e) => {
-                safeSetPointerCapture(e.currentTarget, e.pointerId);
-                startDragFolder(folder.id);
-              }}
+              onContextMenu={(e) => e.preventDefault()}
+              {...longPress}
               onClick={() => setCollapsed((v) => !v)}
               title={folder.name}
-              className="flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium text-ink-700 hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700"
+              className={clsx(
+                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-sm font-medium text-ink-700 hover:bg-ink-100 active:cursor-grabbing dark:hover:bg-ink-700",
+                NO_IOS_CALLOUT
+              )}
             >
               <span className="min-w-0 flex-1 truncate">{folder.name}</span>
             </button>
@@ -138,7 +150,7 @@ export function FolderNode({
               label="フォルダの操作"
               size="sm"
               onClick={() => setMenuOpen((v) => !v)}
-              className={HOVER_REVEAL}
+              className={actionIconClass(menuOpen || editing)}
             >
               <MoreHorizontal size={14} />
             </IconButton>

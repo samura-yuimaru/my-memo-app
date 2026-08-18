@@ -5,6 +5,7 @@ import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { MobileToolbar } from "./MobileToolbar";
+import { KeyboardToolbar } from "./KeyboardToolbar";
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 440;
@@ -129,6 +130,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <Header onMenuClick={() => setMobileMenuOpen(true)} />
         <main className="flex-1 overflow-y-auto overscroll-contain">{children}</main>
         <MobileToolbar />
+        <KeyboardToolbar />
       </div>
     </div>
   );
