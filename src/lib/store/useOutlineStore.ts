@@ -248,6 +248,28 @@ function mergeByUpdatedAt<T extends { id: string; updatedAt: string }>(
   return Array.from(map.values());
 }
 
+/**
+ * 差分チェック: ローカルのdirtyフラグのうち、リモート側が同じか新しい(=ローカルの
+ * 未送信の変更が既にリモートに追いついている、または他端末の変更で追い越されている)
+ * ものを取り除く。「本当に未送信の変更が無いレコード」を次回のflushで送らずに済ませ、
+ * 通信回数・待ち時間を最小限にするための最適化。
+ */
+function clearDirtyForRemoteWins<T extends { id: string; updatedAt: string }>(
+  table: SyncTable,
+  local: T[],
+  remote: T[]
+): void {
+  const localMap = new Map(local.map((item) => [item.id, item]));
+  const upToDateIds = remote
+    .filter((r) => {
+      const l = localMap.get(r.id);
+      return !l || l.updatedAt <= r.updatedAt;
+    })
+    .map((r) => r.id);
+  if (upToDateIds.length === 0) return;
+  void Promise.all(upToDateIds.map((id) => dbClearDirty(table, id)));
+}
+
 export const useOutlineStore = create<OutlineState>()((set, get) => ({
   initialized: false,
   userId: null,
@@ -371,6 +393,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       "folders",
       remoteFolders.map((f) => f.id)
     );
+    void clearDirtyForRemoteWins("folders", local, remoteFolders);
     const merged = sortFolders(mergeByUpdatedAt(local, remoteFolders));
     await Promise.all(merged.map((f) => dbPutFolder(f)));
     set({ folders: merged });
@@ -396,6 +419,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       "notes",
       remoteNotes.map((n) => n.id)
     );
+    void clearDirtyForRemoteWins("notes", local, remoteNotes);
     const merged = sortNotes(mergeByUpdatedAt(local, remoteNotes));
     await Promise.all(merged.map((n) => dbPutNote(n)));
     set({ notesList: merged });
@@ -438,7 +462,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
           "nodes",
           remoteNodes.map((n) => n.id)
         );
-        const merged = mergeByUpdatedAt(Object.values(get().nodes), remoteNodes);
+        const localNodesBeforeMerge = Object.values(get().nodes);
+        void clearDirtyForRemoteWins("nodes", localNodesBeforeMerge, remoteNodes);
+        const merged = mergeByUpdatedAt(localNodesBeforeMerge, remoteNodes);
         await dbPutNodes(merged);
         if (get().currentNoteId === noteId) {
           set({ nodes: toMap(merged) });
@@ -1536,12 +1562,14 @@ function sanitizeNoteRowFolderRef(row: NoteRowType): NoteRowType {
 }
 
 /**
- * 指定テーブルの行群をinsert/updateへ明示的に振り分けて送信し、失敗したidの集合を返す。
- * まだ存在しないとわかっている行はまとめて1回のinsert([...])で送る(通信回数を削減する
- * 真のバッチ送信)。既に存在する行はupdate().eq('id', id)が1件=1リクエストという
- * REST APIの制約上まとめて1回にはできないため、Promise.allで並列送信して待ち時間を縮める。
- * .upsert()は一切使わず、失敗した行はsafeWrite内で逆操作へフォールバックするため、
- * 409/23505がコンソールへ表面化することは無い。
+ * 指定テーブルの行群を、新規/既存を問わずまとめて1回のupsert(rows, { onConflict: 'id' })
+ * で送信する(通信回数・待ち時間が最小になる正規ルート)。onConflict指定により、
+ * 既存idは更新・新規idは挿入がPostgRES側で自動的に振り分けられるため、通常運用で
+ * 409/23505がここで表面化することは無い。
+ * ごくまれにバッチ全体が失敗した場合(ネットワーク瞬断・予期しない制約違反等)だけ、
+ * 1件ずつinsert/updateへ明示的に振り分け、双方向フォールバック(safeWrite)で確実に
+ * 反映させる保険ルートへ切り替える。これにより結果的に409/23505がコンソールへ
+ * 表面化することは無い。
  */
 async function syncRowsToTable(
   client: SupabaseClient,
@@ -1549,40 +1577,31 @@ async function syncRowsToTable(
   rows: Array<NodeRow | NoteRowType | FolderRowType>
 ): Promise<Set<string>> {
   const failedIds = new Set<string>();
+  if (rows.length === 0) return failedIds;
+
   // notesはFK制約(notes_folder_id_fkey)違反を未然に防ぐため、送信直前に補正しておく
   const sanitizedRows =
     table === "notes" ? (rows as NoteRowType[]).map(sanitizeNoteRowFolderRef) : rows;
-  const newRows = sanitizedRows.filter((r) => !isKnownRemote(table, r.id));
-  const existingRows = sanitizedRows.filter((r) => isKnownRemote(table, r.id));
 
-  if (newRows.length > 0) {
-    const { error } = await tryInsert(client, table, newRows);
-    if (!error) {
-      markKnownRemote(
-        table,
-        newRows.map((r) => r.id)
-      );
-    } else {
-      console.log(`[Sync] ${table}の一括insertが失敗したため、1件ずつ再適用します:`, error.message);
-      for (const row of newRows) {
-        const result = await safeWrite(client, table, row.id, row);
-        if (result.error) {
-          devError(`[sync] ${table}(${row.id})の保存に失敗しました:`, result.error.message);
-          failedIds.add(row.id);
-        }
-      }
+  const { error } = await safeCall(() =>
+    client.from(table).upsert(sanitizedRows, { onConflict: "id", ignoreDuplicates: false })
+  );
+  if (!error) {
+    markKnownRemote(
+      table,
+      sanitizedRows.map((r) => r.id)
+    );
+    return failedIds;
+  }
+
+  console.log(`[Sync] ${table}の一括upsertが失敗したため、1件ずつ再適用します:`, error.message);
+  const results = await Promise.all(sanitizedRows.map((row) => safeWrite(client, table, row.id, row)));
+  results.forEach((result, i) => {
+    if (result.error) {
+      devError(`[sync] ${table}(${sanitizedRows[i].id})の保存に失敗しました:`, result.error.message);
+      failedIds.add(sanitizedRows[i].id);
     }
-  }
-
-  if (existingRows.length > 0) {
-    const results = await Promise.all(existingRows.map((row) => safeWrite(client, table, row.id, row)));
-    results.forEach((result, i) => {
-      if (result.error) {
-        devError(`[sync] ${table}(${existingRows[i].id})の保存に失敗しました:`, result.error.message);
-        failedIds.add(existingRows[i].id);
-      }
-    });
-  }
+  });
 
   return failedIds;
 }
@@ -1701,7 +1720,9 @@ async function refreshCurrentNoteNodesFromRemote(noteId: string): Promise<void> 
   );
   // タブが非表示だった間に別のメモへ遷移していた場合は反映しない
   if (useOutlineStore.getState().currentNoteId !== noteId) return;
-  const merged = mergeByUpdatedAt(Object.values(useOutlineStore.getState().nodes), remoteNodes);
+  const localNodesBeforeMerge = Object.values(useOutlineStore.getState().nodes);
+  void clearDirtyForRemoteWins("nodes", localNodesBeforeMerge, remoteNodes);
+  const merged = mergeByUpdatedAt(localNodesBeforeMerge, remoteNodes);
   await dbPutNodes(merged);
   if (useOutlineStore.getState().currentNoteId === noteId) {
     useOutlineStore.setState({ nodes: toMap(merged) });
