@@ -1,17 +1,15 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { CheckSquare, ChevronRight, Folder, FolderPlus, MoreHorizontal, Pencil, Plus, Square, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { ChevronRight, Folder, FolderPlus, MoreHorizontal, Pencil, Plus, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
-import { safeSetPointerCapture } from "@/lib/utils/dnd";
-import { useLongPress } from "@/lib/utils/useLongPress";
+import { useRowDrag } from "@/lib/utils/useRowDrag";
 import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { NoteRow } from "./NoteRow";
 import { useSidebarDnd } from "./SidebarDndContext";
-import { useSidebarSelection } from "./SidebarSelectionContext";
 import type { FolderData, NoteData } from "@/types/outline";
 
 interface FolderNodeProps {
@@ -27,8 +25,6 @@ interface FolderNodeProps {
 
 /** 1階層あたりの字下げ幅。「1段下がった」ことがひと目でわかるよう、ツリーガイド線とあわせて広めに取る */
 const INDENT = 20;
-/** マウスでこの距離を超えて動いたら、クリックではなくドラッグ開始とみなす */
-const MOUSE_DRAG_THRESHOLD = 4;
 
 /** フォルダ1件分(見出し + 中のメモ + サブフォルダを再帰的に描画) */
 export function FolderNode({
@@ -45,7 +41,6 @@ export function FolderNode({
   const deleteFolder = useOutlineStore((s) => s.deleteFolder);
   const createFolder = useOutlineStore((s) => s.createFolder);
   const { draggingItem, dropTarget, startDragFolder } = useSidebarDnd();
-  const { selectionMode, isSelected, handleItemPress } = useSidebarSelection();
 
   const [collapsed, setCollapsed] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -59,10 +54,6 @@ export function FolderNode({
   const isDropTarget = dropTarget === folder.id;
   const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
   const isEmpty = childFolders.length === 0 && notes.length === 0;
-  const selected = isSelected("folder", folder.id);
-  // メモ側(NoteRow)の「選択中/開いている」ハイライトと完全に同じ配色ロジックにする。
-  // isDropTargetもドラッグ中のドロップ先案内として同じ配色を流用する。
-  const highlighted = selected || isDropTarget;
 
   function startEditing() {
     setDraft(folder.name);
@@ -85,62 +76,16 @@ export function FolderNode({
     await deleteFolder(folder.id);
   }
 
-  // フォルダ名の押下は「クリック(選択/折りたたみ)」「ドラッグ移動」「名前変更」の
-  // 3つがはっきり分かれるようにしている:
+  // 行(見出し)のどこを押しても、フォルダ・メモの両方で全く同じ操作感でドラッグを開始できる
+  // (NoteRowと共通のuseRowDragフック)。
   // ・タッチ/ペン: 長押しでドラッグを開始する(短いタップは折りたたみのトグルのまま)
-  // ・マウス: 一定距離(MOUSE_DRAG_THRESHOLD)を超えて動いた瞬間にドラッグを開始する。
-  //   ただのクリック(移動なし)ではドラッグが一切始まらないため、クリックのたびに
-  //   誤ってドラッグ状態が組まれてしまう(=クリックだけで挙動がおかしくなる)ことがない
-  // 名前変更モードへの移行はダブルクリック・コンテキストメニュー・「…」メニューからのみ行い、
-  // クリックやドラッグでは絶対に起動しない。
-  const longPress = useLongPress({
-    onLongPress: ({ pointerId, target }) => {
-      safeSetPointerCapture(target, pointerId);
-      startDragFolder(folder.id);
-    },
+  // ・マウス: 一定距離を超えて動いた瞬間にドラッグを開始する。ただのクリック(移動なし)では
+  //   ドラッグが一切始まらないため、クリックのたびに誤ってドラッグ状態が組まれてしまうことがない
+  // 折りたたみ矢印・「…」メニュー・名前変更中のinputはdata-no-dragを付け、ドラッグの起点から除外する。
+  // 名前変更モードへの移行はダブルクリック・コンテキストメニュー・「…」メニューからのみ行う。
+  const rowDrag = useRowDrag({
+    onStartDrag: () => startDragFolder(folder.id),
   });
-  const mouseDragRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
-
-  function handleNamePointerDown(e: React.PointerEvent<HTMLButtonElement>) {
-    if (e.pointerType === "mouse") {
-      mouseDragRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
-      return;
-    }
-    longPress.onPointerDown(e);
-  }
-  function handleNamePointerMove(e: React.PointerEvent<HTMLButtonElement>) {
-    if (e.pointerType === "mouse") {
-      const start = mouseDragRef.current;
-      if (!start) return;
-      const dx = e.clientX - start.x;
-      const dy = e.clientY - start.y;
-      if (Math.hypot(dx, dy) > MOUSE_DRAG_THRESHOLD) {
-        safeSetPointerCapture(e.currentTarget, start.pointerId);
-        startDragFolder(folder.id);
-        mouseDragRef.current = null;
-      }
-      return;
-    }
-    longPress.onPointerMove(e);
-  }
-  function handleNamePointerUp(e: React.PointerEvent<HTMLButtonElement>) {
-    mouseDragRef.current = null;
-    longPress.onPointerUp(e);
-  }
-  function handleNamePointerCancel(e: React.PointerEvent<HTMLButtonElement>) {
-    mouseDragRef.current = null;
-    longPress.onPointerCancel(e);
-  }
-
-  function handleNameClick(e: React.MouseEvent) {
-    const consumed = handleItemPress("folder", folder.id, {
-      ctrlKey: e.ctrlKey,
-      metaKey: e.metaKey,
-      shiftKey: e.shiftKey,
-    });
-    if (consumed) return;
-    setCollapsed((v) => !v);
-  }
 
   return (
     <div className={clsx(isDraggingSelf && "opacity-40")}>
@@ -152,26 +97,17 @@ export function FolderNode({
         {depth > 0 && <SidebarIndentGuides depth={depth} />}
 
         <div
+          {...rowDrag}
           className={clsx(
-            "group/actions flex items-center gap-1 rounded-lg px-1 py-1.5",
-            selected && !isDropTarget && SELECTED_BG_CLASS
+            "group/actions flex cursor-grab items-center gap-1 rounded-lg px-1 py-1.5 active:cursor-grabbing",
+            NO_IOS_CALLOUT,
+            isDraggingSelf && "touch-none"
           )}
           onContextMenu={(e) => {
             e.preventDefault();
             setMenuOpen(true);
           }}
         >
-          {selectionMode && (
-            <button
-              type="button"
-              onClick={() => handleItemPress("folder", folder.id, { ctrlKey: true, metaKey: false, shiftKey: false })}
-              className="flex h-6 w-6 shrink-0 items-center justify-center text-accent-600"
-              aria-label={selected ? "選択解除" : "選択"}
-            >
-              {selected ? <CheckSquare size={17} /> : <Square size={17} className="text-ink-300" />}
-            </button>
-          )}
-
           {isEmpty ? (
             // 中身が何もないフォルダは開閉しても表示が変わらないため、トグル矢印自体を
             // 出さない(誤操作の余地をなくし、サイドバーの視覚的なノイズも減らす)
@@ -179,11 +115,12 @@ export function FolderNode({
           ) : (
             <button
               type="button"
+              data-no-drag="true"
               onClick={() => setCollapsed((v) => !v)}
               title={collapsed ? "展開する" : "折りたたむ"}
               className={clsx(
                 "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100",
-                highlighted ? SELECTED_TEXT_CLASS : "text-ink-400"
+                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
               )}
             >
               <ChevronRight size={16} className={clsx("transition-transform", !collapsed && "rotate-90")} />
@@ -193,6 +130,7 @@ export function FolderNode({
           {editing ? (
             <input
               autoFocus
+              data-no-drag="true"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onBlur={commitRename}
@@ -211,23 +149,16 @@ export function FolderNode({
           ) : (
             <button
               type="button"
-              data-sidebar-item={`folder:${folder.id}`}
-              data-drag-handle="true"
               onContextMenu={(e) => e.preventDefault()}
-              onPointerDown={handleNamePointerDown}
-              onPointerMove={handleNamePointerMove}
-              onPointerUp={handleNamePointerUp}
-              onPointerCancel={handleNamePointerCancel}
-              onClick={handleNameClick}
+              onClick={() => setCollapsed((v) => !v)}
               onDoubleClick={(e) => {
                 e.preventDefault();
                 startEditing();
               }}
               title={folder.name}
               className={clsx(
-                "flex min-w-0 flex-1 cursor-grab touch-none items-center gap-1.5 rounded px-1 py-0.5 text-left text-base font-medium hover:bg-ink-100 active:cursor-grabbing",
-                highlighted ? SELECTED_TEXT_CLASS : "text-ink-700",
-                NO_IOS_CALLOUT
+                "flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left text-base font-medium hover:bg-ink-100",
+                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700"
               )}
             >
               <Folder size={16} className="shrink-0 opacity-70" aria-hidden="true" />
@@ -237,12 +168,12 @@ export function FolderNode({
 
           {/* フォルダの操作は右クリックのコンテキストメニューと、この「…」に集約する
               (フォルダ名が見切れないよう、常時表示のアイコンは最小限にとどめる) */}
-          <div className="relative shrink-0">
+          <div className="relative shrink-0" data-no-drag="true">
             <IconButton
               label="フォルダの操作"
               size="sm"
               onClick={() => setMenuOpen((v) => !v)}
-              className={clsx(highlighted && SELECTED_TEXT_CLASS, actionIconClass(menuOpen || editing || highlighted))}
+              className={clsx(isDropTarget && SELECTED_TEXT_CLASS, actionIconClass(menuOpen || editing || isDropTarget))}
             >
               <MoreHorizontal size={16} />
             </IconButton>

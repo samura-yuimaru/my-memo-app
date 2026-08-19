@@ -1,15 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { CheckSquare, FileText, GripVertical, Square, Trash2 } from "lucide-react";
+import { FileText, Trash2 } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
 import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
-import { safeSetPointerCapture } from "@/lib/utils/dnd";
-import { useLongPress } from "@/lib/utils/useLongPress";
+import { useRowDrag } from "@/lib/utils/useRowDrag";
 import { useSidebarDnd } from "./SidebarDndContext";
-import { useSidebarSelection } from "./SidebarSelectionContext";
 import type { NoteData } from "@/types/outline";
 
 interface NoteRowProps {
@@ -20,18 +18,14 @@ interface NoteRowProps {
 }
 
 /**
- * サイドバーのメモ1件分の行。左端のグリップに加えて、行全体を長押しすることでも
- * ドラッグを開始できる(iPadで小さいグリップを正確につまむ必要をなくすため)。
- * 長押しして指を動かさずに離すと、その場でメモ名を変更できる(iOSのリンクプレビューは
- * 発動しないよう抑止している)。Ctrl/Cmd+クリック・Shift+クリック・選択モードでの
- * 複数選択にも対応する。
+ * サイドバーのメモ1件分の行。行のどこを押してもドラッグを開始できる(FolderNodeと共通の
+ * useRowDragフック)。長押しして指を動かさずに離すと、その場でメモ名を変更できる
+ * (iOSのリンクプレビューは発動しないよう抑止している)。
  */
 export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
   const { draggingItem, startDragNote } = useSidebarDnd();
-  const { selectionMode, isSelected, handleItemPress } = useSidebarSelection();
   const renameNote = useOutlineStore((s) => s.renameNote);
   const isDragging = draggingItem?.type === "note" && draggingItem.id === note.id;
-  const selected = isSelected("note", note.id);
 
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(note.title);
@@ -47,67 +41,35 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
     setRenaming(false);
   }
 
-  const longPress = useLongPress({
-    onLongPress: ({ pointerId, target }) => {
-      safeSetPointerCapture(target, pointerId);
-      startDragNote(note.id);
-    },
+  // フォルダの行(FolderNode)と全く同じ操作感: 行のどこを押しても、長押し(タッチ)/
+  // しきい値超えの移動(マウス)でドラッグを開始できる。動かさずに離すと名前変更を開始する。
+  const rowDrag = useRowDrag({
+    onStartDrag: () => startDragNote(note.id),
     onLongPressRelease: startRenaming,
   });
 
   function handleNoteClick(e: React.MouseEvent) {
     e.preventDefault();
-    const consumed = handleItemPress("note", note.id, {
-      ctrlKey: e.ctrlKey,
-      metaKey: e.metaKey,
-      shiftKey: e.shiftKey,
-    });
-    if (consumed) return;
     onOpen();
   }
 
-  const highlighted = active || selected;
+  const highlighted = active;
 
   return (
     <li className="group/actions">
       <div
+        {...rowDrag}
         className={clsx(
-          "flex items-center gap-1 rounded-lg pr-1",
-          isDragging && "opacity-40",
+          "flex cursor-grab items-center gap-1 rounded-lg pr-1 active:cursor-grabbing",
+          NO_IOS_CALLOUT,
+          isDragging && "touch-none opacity-40",
           highlighted ? SELECTED_BG_CLASS : "hover:bg-ink-100"
         )}
       >
-        {selectionMode && (
-          <button
-            type="button"
-            onClick={() => handleItemPress("note", note.id, { ctrlKey: true, metaKey: false, shiftKey: false })}
-            className="flex h-7 w-6 shrink-0 items-center justify-center text-accent-600"
-            aria-label={selected ? "選択解除" : "選択"}
-          >
-            {selected ? <CheckSquare size={17} /> : <Square size={17} className="text-ink-300" />}
-          </button>
-        )}
-
-        <button
-          type="button"
-          data-drag-handle="true"
-          onPointerDown={(e) => {
-            safeSetPointerCapture(e.currentTarget, e.pointerId);
-            startDragNote(note.id);
-          }}
-          title="ドラッグしてフォルダへ移動"
-          className={clsx(
-            "flex h-7 w-5 shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing",
-            highlighted ? SELECTED_TEXT_CLASS : "text-ink-300",
-            actionIconClass(highlighted)
-          )}
-        >
-          <GripVertical size={14} />
-        </button>
-
         {renaming ? (
           <input
             autoFocus
+            data-no-drag="true"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commitRename}
@@ -121,18 +83,15 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
                 setRenaming(false);
               }
             }}
-            className="min-w-0 flex-1 rounded border border-accent-300 bg-surface px-1.5 py-1 text-base text-ink-800 outline-none"
+            className="ml-1 min-w-0 flex-1 rounded border border-accent-300 bg-surface px-1.5 py-1 text-base text-ink-800 outline-none"
           />
         ) : (
           <a
             href={`/notes/${note.id}`}
-            data-sidebar-item={`note:${note.id}`}
             onClick={handleNoteClick}
             onContextMenu={(e) => e.preventDefault()}
-            {...longPress}
             className={clsx(
-              "flex min-w-0 flex-1 touch-none items-center gap-2 rounded-lg py-2.5 pr-1 text-base",
-              NO_IOS_CALLOUT,
+              "flex min-w-0 flex-1 items-center gap-2 rounded-lg py-2.5 pl-2 pr-1 text-base",
               highlighted ? SELECTED_TEXT_CLASS : "text-ink-700"
             )}
           >
@@ -144,6 +103,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
         <IconButton
           label="このメモを削除"
           size="sm"
+          data-no-drag="true"
           onClick={onDelete}
           className={clsx(
             "shrink-0 hover:!bg-rose-100 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400",
