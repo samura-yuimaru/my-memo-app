@@ -28,6 +28,7 @@ import {
   midpointPosition,
   sequentialPositions,
 } from "@/lib/utils/tree";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import { ensureAnonymousSession } from "@/lib/supabase/auth";
 import {
@@ -37,7 +38,9 @@ import {
   nodeToRow,
   noteFromRow,
   noteToRow,
+  type FolderRow as FolderRowType,
   type NodeRow,
+  type NoteRow as NoteRowType,
 } from "@/lib/supabase/mappers";
 import {
   dbAddPendingDelete,
@@ -61,6 +64,7 @@ import {
   dbPutNote,
   dbSetMeta,
   dbDeleteNote as dbDeleteNoteLocal,
+  type SyncTable,
 } from "@/lib/db/indexeddb";
 
 /** メモの既定タイトル。1行目からのタイトル自動抽出は、この値のときだけ発動する */
@@ -452,7 +456,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     set((s) => ({
       notesList: sortNotes(s.notesList.map((n) => (n.id === noteId ? updated : n))),
     }));
-    void persistNote(updated, { debounceMs: 500 });
+    void persistNote(updated);
   },
 
   deleteNote: async (noteId) => {
@@ -510,7 +514,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     set((s) => ({
       folders: sortFolders(s.folders.map((f) => (f.id === folderId ? updated : f))),
     }));
-    void persistFolder(updated, { debounceMs: 500 });
+    void persistFolder(updated);
   },
 
   moveFolderTo: (folderId, newParentId) => {
@@ -583,7 +587,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       const previousFirstLineTitle = htmlToPlainText(node.content).trim().slice(0, 100) || DEFAULT_NOTE_TITLE;
       maybeAutoTitleFromFirstNode(noteId, get().nodes, previousFirstLineTitle);
     }
-    void persistNode(updated, { debounceMs: 500 });
+    void persistNode(updated);
   },
 
   splitNode: (nodeId, splitIndex) => {
@@ -610,7 +614,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       nodes: { ...s.nodes, [nodeId]: updatedCurrent, [newNode.id]: newNode },
       focusRequest: { id: newNode.id, caret: "start" },
     }));
-    void persistNode(updatedCurrent, { debounceMs: 500 });
+    void persistNode(updatedCurrent);
     void persistNode(newNode);
   },
 
@@ -658,7 +662,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       });
       return { nodes: next, focusRequest: focusTarget };
     });
-    void persistNode(updatedCurrent, { debounceMs: 500 });
+    void persistNode(updatedCurrent);
     newNodes.forEach((n) => void persistNode(n));
   },
 
@@ -689,7 +693,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       next[prev.id] = updatedPrev;
       return { nodes: next, focusRequest: { id: prev.id, caret: caretPos } };
     });
-    void persistNode(updatedPrev, { debounceMs: 500 });
+    void persistNode(updatedPrev);
     void persistDeleteNodes([nodeId], node.noteId);
   },
 
@@ -1282,7 +1286,6 @@ function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
 // ============================================================
 
 let unsubscribeRealtime: (() => void) | null = null;
-const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // ============================================================
 // Undo/Redo履歴
@@ -1375,6 +1378,109 @@ async function safeCall<F extends () => PromiseLike<{ error: { message: string }
     return {
       error: { message },
     } as Awaited<ReturnType<F>>;
+  }
+}
+
+/** 409 Conflict / 23505 (unique_violation) をエラーメッセージから判定する */
+function isConflictError(message: string): boolean {
+  return /409/.test(message) || /23505/.test(message) || /duplicate key/i.test(message) || /conflict/i.test(message);
+}
+
+/**
+ * 409 Conflict / 23505 (unique_violation) を絶対に表面化させないための安全なupsert。
+ * 通常は upsert(rows, { onConflict: 'id', ignoreDuplicates: false }) でそのまま
+ * (新規行はinsert・既存idの行は上書き)書き込めるが、ごくまれな競合(同一idへの
+ * ほぼ同時書き込み等)で409/23505として返ってくることがある。その場合だけ、
+ * 該当行を1件ずつ update().eq('id', id) にフォールバックして確実に反映させる
+ * (これによりコンソールに409/23505エラーが出ることは無くなる)。
+ */
+async function safeUpsert(
+  client: SupabaseClient,
+  table: SyncTable,
+  rows: Array<NodeRow | NoteRowType | FolderRowType>
+): Promise<{ error: { message: string } | null }> {
+  if (rows.length === 0) return { error: null };
+
+  const { error } = await safeCall(() =>
+    client.from(table).upsert(rows, { onConflict: "id", ignoreDuplicates: false })
+  );
+  if (!error) return { error: null };
+  if (!isConflictError(error.message)) return { error };
+
+  console.log(`[Sync] ${table}で409/23505を検知したため、update()へフォールバックして再適用します`);
+  // バッチ全体を巻き込んで失敗させないよう、行ごとにupdateへフォールバックする
+  let firstError: { message: string } | null = null;
+  for (const row of rows) {
+    const id = row.id;
+    const { error: updateError } = await safeCall(() => client.from(table).update(row).eq("id", id));
+    if (updateError) {
+      devError(`[sync] ${table}(${id})のupdateフォールバックにも失敗しました:`, updateError.message);
+      firstError = firstError ?? updateError;
+    } else {
+      console.log(`[Sync] ${table}(${id})をupdateフォールバックで復旧しました`);
+    }
+  }
+  return { error: firstError };
+}
+
+/**
+ * Supabaseへの同期リクエストをテーブル単位でまとめて軽量化するバッチキュー。
+ * persistNode/persistNote/persistFolderは呼ばれるたびに即座に通信するのではなく、
+ * ここへ「そのidの最新の行データ」を積むだけにする。同じidに何度persistしても
+ * キュー上では1件に上書きされる(=同一レコードへの連続編集が1回の送信に自然と
+ * まとまる)うえ、SYNC_DEBOUNCE_MS(1000ms)待って複数idをまとめて1回のupsertで
+ * 送るため、通信回数・データ量の両方を最小限に抑えられる。
+ */
+const SYNC_DEBOUNCE_MS = 1000;
+const pendingSyncRows = new Map<SyncTable, Map<string, NodeRow | NoteRowType | FolderRowType>>();
+const syncFlushTimers = new Map<SyncTable, ReturnType<typeof setTimeout>>();
+
+function queueRowForSync(table: SyncTable, id: string, row: NodeRow | NoteRowType | FolderRowType): void {
+  let tableQueue = pendingSyncRows.get(table);
+  if (!tableQueue) {
+    tableQueue = new Map();
+    pendingSyncRows.set(table, tableQueue);
+  }
+  tableQueue.set(id, row);
+
+  const existingTimer = syncFlushTimers.get(table);
+  if (existingTimer) clearTimeout(existingTimer);
+  syncFlushTimers.set(
+    table,
+    setTimeout(() => {
+      syncFlushTimers.delete(table);
+      void flushTableQueue(table);
+    }, SYNC_DEBOUNCE_MS)
+  );
+}
+
+/** キューに溜まった特定テーブルの全行を、1回のバッチupsertでまとめて送信する */
+async function flushTableQueue(table: SyncTable): Promise<void> {
+  const tableQueue = pendingSyncRows.get(table);
+  if (!tableQueue || tableQueue.size === 0) return;
+  const ids = Array.from(tableQueue.keys());
+  const rows = Array.from(tableQueue.values());
+  pendingSyncRows.delete(table);
+
+  const client = getSupabaseClient();
+  const { userId } = useOutlineStore.getState();
+  if (!client || !userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    // 送信できない状況ならdirtyへ戻し、オンライン復帰時にflushPendingSyncで再送されるようにする
+    await Promise.all(ids.map((id) => dbMarkDirty(table, id)));
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
+  }
+
+  console.log(`[Sync] ${table}をバッチ送信します (${rows.length}件, id=${ids.join(",")})`);
+  const { error } = await safeUpsert(client, table, rows);
+  if (error) {
+    devError(`[sync] ${table}のバッチ送信に失敗しました:`, error.message);
+    console.log(`[Sync] ${table}のバッチ送信が失敗しました:`, error.message);
+    await Promise.all(ids.map((id) => dbMarkDirty(table, id)));
+    useOutlineStore.setState({ syncStatus: "error" });
+  } else {
+    await Promise.all(ids.map((id) => dbClearDirty(table, id)));
+    markSynced();
   }
 }
 
@@ -1536,10 +1642,7 @@ function touchNoteTimestamp(noteId: string): void {
   );
 }
 
-async function persistNode(
-  node: OutlineNodeData,
-  options?: { debounceMs?: number }
-): Promise<void> {
+async function persistNode(node: OutlineNodeData): Promise<void> {
   touchNoteTimestamp(node.noteId);
   await dbPutNode(node);
 
@@ -1548,41 +1651,19 @@ async function persistNode(
     useOutlineStore.setState({ syncStatus: "offline" });
     return;
   }
-
-  const push = async () => {
-    const { userId } = useOutlineStore.getState();
-    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
-      await dbMarkDirty("nodes", node.id);
-      useOutlineStore.setState({ syncStatus: "offline" });
-      return;
-    }
-    const { error } = await safeCall(() => client.from("nodes").upsert(nodeToRow(node, userId), { onConflict: "id" }));
-    if (error) {
-      devError("[sync] ノードの保存に失敗しました:", error.message);
-      await dbMarkDirty("nodes", node.id);
-      useOutlineStore.setState({ syncStatus: "error" });
-    } else {
-      await dbClearDirty("nodes", node.id);
-      markSynced();
-    }
-  };
-
-  if (options?.debounceMs) {
-    useOutlineStore.setState({ syncStatus: "saving" });
-    const key = `node:${node.id}`;
-    const existing = debounceTimers.get(key);
-    if (existing) clearTimeout(existing);
-    debounceTimers.set(
-      key,
-      setTimeout(() => {
-        debounceTimers.delete(key);
-        void push();
-      }, options.debounceMs)
-    );
-  } else {
-    useOutlineStore.setState({ syncStatus: "saving" });
-    await push();
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await dbMarkDirty("nodes", node.id);
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
   }
+
+  // 即座に通信はせず、バッチキューに積むだけにする(SYNC_DEBOUNCE_MS後にまとめて送信)。
+  // dirty化はここで先に行っておくことで、送信が完了する前にページを閉じても
+  // 次回起動時のflushPendingSyncで確実に再送される。
+  await dbMarkDirty("nodes", node.id);
+  useOutlineStore.setState({ syncStatus: "saving" });
+  queueRowForSync("nodes", node.id, nodeToRow(node, userId));
 }
 
 async function persistDeleteNodes(ids: string[], noteId?: string | null): Promise<void> {
@@ -1613,10 +1694,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
   }
 }
 
-async function persistNote(
-  note: NoteData,
-  options?: { debounceMs?: number }
-): Promise<void> {
+async function persistNote(note: NoteData): Promise<void> {
   await dbPutNote(note);
 
   const client = getSupabaseClient();
@@ -1624,39 +1702,16 @@ async function persistNote(
     useOutlineStore.setState({ syncStatus: "offline" });
     return;
   }
-
-  const push = async () => {
-    const { userId } = useOutlineStore.getState();
-    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
-      await dbMarkDirty("notes", note.id);
-      useOutlineStore.setState({ syncStatus: "offline" });
-      return;
-    }
-    const { error } = await safeCall(() => client.from("notes").upsert(noteToRow(note, userId), { onConflict: "id" }));
-    if (error) {
-      devError("[sync] メモの保存に失敗しました:", error.message);
-      await dbMarkDirty("notes", note.id);
-      useOutlineStore.setState({ syncStatus: "error" });
-    } else {
-      await dbClearDirty("notes", note.id);
-      markSynced();
-    }
-  };
-
-  if (options?.debounceMs) {
-    const key = `note:${note.id}`;
-    const existing = debounceTimers.get(key);
-    if (existing) clearTimeout(existing);
-    debounceTimers.set(
-      key,
-      setTimeout(() => {
-        debounceTimers.delete(key);
-        void push();
-      }, options.debounceMs)
-    );
-  } else {
-    await push();
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await dbMarkDirty("notes", note.id);
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
   }
+
+  await dbMarkDirty("notes", note.id);
+  useOutlineStore.setState({ syncStatus: "saving" });
+  queueRowForSync("notes", note.id, noteToRow(note, userId));
 }
 
 async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise<void> {
@@ -1677,10 +1732,7 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
   }
 }
 
-async function persistFolder(
-  folder: FolderData,
-  options?: { debounceMs?: number }
-): Promise<void> {
+async function persistFolder(folder: FolderData): Promise<void> {
   await dbPutFolder(folder);
 
   const client = getSupabaseClient();
@@ -1688,39 +1740,16 @@ async function persistFolder(
     useOutlineStore.setState({ syncStatus: "offline" });
     return;
   }
-
-  const push = async () => {
-    const { userId } = useOutlineStore.getState();
-    if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
-      await dbMarkDirty("folders", folder.id);
-      useOutlineStore.setState({ syncStatus: "offline" });
-      return;
-    }
-    const { error } = await safeCall(() => client.from("folders").upsert(folderToRow(folder, userId), { onConflict: "id" }));
-    if (error) {
-      devError("[sync] フォルダの保存に失敗しました:", error.message);
-      await dbMarkDirty("folders", folder.id);
-      useOutlineStore.setState({ syncStatus: "error" });
-    } else {
-      await dbClearDirty("folders", folder.id);
-      markSynced();
-    }
-  };
-
-  if (options?.debounceMs) {
-    const key = `folder:${folder.id}`;
-    const existing = debounceTimers.get(key);
-    if (existing) clearTimeout(existing);
-    debounceTimers.set(
-      key,
-      setTimeout(() => {
-        debounceTimers.delete(key);
-        void push();
-      }, options.debounceMs)
-    );
-  } else {
-    await push();
+  const { userId } = useOutlineStore.getState();
+  if (!userId || (typeof navigator !== "undefined" && !navigator.onLine)) {
+    await dbMarkDirty("folders", folder.id);
+    useOutlineStore.setState({ syncStatus: "offline" });
+    return;
   }
+
+  await dbMarkDirty("folders", folder.id);
+  useOutlineStore.setState({ syncStatus: "saving" });
+  queueRowForSync("folders", folder.id, folderToRow(folder, userId));
 }
 
 /**
@@ -1760,38 +1789,70 @@ export async function flushPendingSync(): Promise<void> {
     pendingDeletes.length,
     "件"
   );
+  // テーブルごとにidをまとめ、1テーブルにつき1回のdelete().in('id', ids)で送る
+  // (削除件数が多くても、1件ずつ何十回もリクエストを送るループにならないようにする)
+  const deletesByTable = new Map<SyncTable, { key: number; recordId: string }[]>();
   for (const pd of pendingDeletes) {
-    const { error } = await safeCall(() => client.from(pd.table).delete().eq("id", pd.recordId));
-    if (!error) await dbClearPendingDelete(pd.key);
+    const list = deletesByTable.get(pd.table) ?? [];
+    list.push({ key: pd.key, recordId: pd.recordId });
+    deletesByTable.set(pd.table, list);
+  }
+  for (const [table, items] of deletesByTable) {
+    const { error } = await safeCall(() =>
+      client
+        .from(table)
+        .delete()
+        .in(
+          "id",
+          items.map((it) => it.recordId)
+        )
+    );
+    if (!error) {
+      await Promise.all(items.map((it) => dbClearPendingDelete(it.key)));
+    } else {
+      devError(`[sync] ${table}の削除キュー送信に失敗しました:`, error.message);
+    }
   }
 
   const dirty = await dbGetAllDirty();
   console.log("[Sync] 同期キューのフラッシュ: 未送信の変更", dirty.length, "件");
+  // テーブルごとにまとめて1回のバッチupsertで送る(1件ずつの逐次送信によるループ・
+  // 過剰な通信回数を防ぎ、通信量を最小限に抑える)
+  const dirtyByTable = new Map<SyncTable, string[]>();
   for (const d of dirty) {
-    if (d.table === "nodes") {
-      const node = await dbGetNode(d.recordId);
-      if (!node) {
-        await dbClearDirty("nodes", d.recordId);
-        continue;
-      }
-      const { error } = await safeCall(() => client.from("nodes").upsert(nodeToRow(node, userId), { onConflict: "id" }));
-      if (!error) await dbClearDirty("nodes", d.recordId);
-    } else if (d.table === "notes") {
-      const note = (await dbGetAllNotes()).find((n) => n.id === d.recordId);
-      if (!note) {
-        await dbClearDirty("notes", d.recordId);
-        continue;
-      }
-      const { error } = await safeCall(() => client.from("notes").upsert(noteToRow(note, userId), { onConflict: "id" }));
-      if (!error) await dbClearDirty("notes", d.recordId);
+    const list = dirtyByTable.get(d.table) ?? [];
+    list.push(d.recordId);
+    dirtyByTable.set(d.table, list);
+  }
+  for (const [table, ids] of dirtyByTable) {
+    let rows: Array<NodeRow | NoteRowType | FolderRowType>;
+    if (table === "nodes") {
+      const found = await Promise.all(ids.map((id) => dbGetNode(id)));
+      rows = found.filter((n): n is OutlineNodeData => !!n).map((n) => nodeToRow(n, userId));
+    } else if (table === "notes") {
+      const all = await dbGetAllNotes();
+      rows = ids
+        .map((id) => all.find((n) => n.id === id))
+        .filter((n): n is NoteData => !!n)
+        .map((n) => noteToRow(n, userId));
     } else {
-      const folder = (await dbGetAllFolders()).find((f) => f.id === d.recordId);
-      if (!folder) {
-        await dbClearDirty("folders", d.recordId);
-        continue;
-      }
-      const { error } = await safeCall(() => client.from("folders").upsert(folderToRow(folder, userId), { onConflict: "id" }));
-      if (!error) await dbClearDirty("folders", d.recordId);
+      const all = await dbGetAllFolders();
+      rows = ids
+        .map((id) => all.find((f) => f.id === id))
+        .filter((f): f is FolderData => !!f)
+        .map((f) => folderToRow(f, userId));
+    }
+    // ローカルにもう存在しない(既に削除済みの)idはdirtyのままにせずクリアする
+    const foundIds = new Set(rows.map((r) => r.id));
+    const missingIds = ids.filter((id) => !foundIds.has(id));
+    if (missingIds.length > 0) await Promise.all(missingIds.map((id) => dbClearDirty(table, id)));
+    if (rows.length === 0) continue;
+
+    const { error } = await safeUpsert(client, table, rows);
+    if (!error) {
+      await Promise.all(rows.map((r) => dbClearDirty(table, r.id)));
+    } else {
+      devError(`[sync] ${table}のバッチ再送に失敗しました:`, error.message);
     }
   }
 

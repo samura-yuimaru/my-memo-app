@@ -2,19 +2,25 @@ import clsx from "clsx";
 
 /**
  * ゴミ箱・並べ替えハンドル・「…」メニュー・スマート構造化・文字色ボタンなど、
- * 行の「操作アイコン」全般に使うクラス。
- * iPad実機ではポインターが指なので常時表示だと階層構造がアイコンだらけで読みにくくなる。
- * そのため常には隠しておき、
+ * 行の「操作アイコン」全般に使うクラス。常には隠しておき、
  *   1) その行が「選択中」(開いている/操作対象になっている) か、
- *   2) 「ホバー中」(マウス・トラックパッド・Apple Pencilホバーなど実際にホバー可能な入力)
- * のときだけ表示する。純粋な指タッチには hover 自体が存在しないため、
- * その場合は行を選んでから操作する2段階のフローになる。
+ *   2) キーボード操作でアイコン自体にフォーカスが移った(アクセシビリティのための例外)
+ * のときだけ表示する。
+ *
+ * hoverReveal(既定true)をfalseにすると、マウスカーソルが乗っただけ(:hover)では
+ * 表示しなくなる。アウトラインのブロック(OutlineNode)は「クリック/タップして選択
+ * (網掛け)した時だけ操作アイコンを出す」仕様のためfalseを渡す。サイドバーのフォルダ/
+ * メモ行はマウス利用時に見つけやすいよう、既定どおりホバーでも表示する。
  */
-export function actionIconClass(selected: boolean): string {
+export function actionIconClass(selected: boolean, options?: { hoverReveal?: boolean }): string {
+  const hoverReveal = options?.hoverReveal ?? true;
   return clsx(
     selected
       ? "opacity-100"
-      : "opacity-0 group-hover/actions:opacity-100 group-focus-within/actions:opacity-100 focus-visible:opacity-100"
+      : clsx(
+          "opacity-0 group-focus-within/actions:opacity-100 focus-visible:opacity-100",
+          hoverReveal && "group-hover/actions:opacity-100"
+        )
   );
 }
 

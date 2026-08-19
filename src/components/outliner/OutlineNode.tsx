@@ -152,7 +152,10 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
             label="このノードを削除"
             size="sm"
             onClick={handleDelete}
-            className={clsx(actionIconClass(isSelected), "hover:!bg-rose-50 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400")}
+            className={clsx(
+              actionIconClass(isSelected, { hoverReveal: false }),
+              "hover:!bg-rose-50 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400"
+            )}
           >
             <Trash2 size={14} />
           </IconButton>

@@ -48,7 +48,7 @@ export function NodeStylePopover({ selected, textColor, getActiveColors, onTextC
         size="sm"
         onMouseDown={preserveSelection}
         onClick={handleToggle}
-        className={actionIconClass(selected || open)}
+        className={actionIconClass(selected || open, { hoverReveal: false })}
       >
         <Baseline size={15} />
       </IconButton>

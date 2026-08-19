@@ -24,7 +24,7 @@ export function SmartBlockMenu({ selected, onInsert }: SmartBlockMenuProps) {
         label="スマート構造化"
         size="sm"
         onClick={() => setOpen((v) => !v)}
-        className={actionIconClass(selected || open)}
+        className={actionIconClass(selected || open, { hoverReveal: false })}
       >
         <Box size={15} />
       </IconButton>
