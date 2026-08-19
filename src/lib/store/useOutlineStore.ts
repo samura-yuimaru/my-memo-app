@@ -340,6 +340,13 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       window.addEventListener("beforeunload", () => {
         flushAllPendingSync();
       });
+      // iPadのPWA(ホーム画面アプリ)ではvisibilitychangeが発火しないウィンドウ切替も
+      // あり得るため、window.onfocusでも同じ最新化を行う(refreshFromRemote内で
+      // 多重実行はガードしているため、visibilitychangeと同時に発火しても二重通信しない)。
+      window.addEventListener("focus", () => {
+        console.log("[Sync] ウィンドウがフォーカスされたため、最新化します");
+        void refreshFromRemote();
+      });
 
       // タイムアウトや一時的な通信障害で送信できなかった変更(dirtyのまま残っている分)を、
       // ユーザー操作やタブの表示/非表示の遷移が起きなくても自動的に拾い直すための
@@ -361,6 +368,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       client.auth.onAuthStateChange((event, session) => {
         console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
+          teardownGlobalRealtimeSubscriptions();
           useOutlineStore.setState({ userId: null });
           void connectSupabase();
           return;
@@ -1354,6 +1362,27 @@ function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
 // ============================================================
 
 let unsubscribeRealtime: (() => void) | null = null;
+/** folders/notes一覧を対象にした常時リアルタイム購読の解除関数(認証済みの間ずっと有効) */
+let unsubscribeFoldersRealtime: (() => void) | null = null;
+let unsubscribeNotesRealtime: (() => void) | null = null;
+
+/**
+ * folders/notesの常時リアルタイム購読を(まだ無ければ)開始する。userIdが確定した
+ * タイミング(起動時の匿名認証成功時・再接続時)で呼ぶ想定。既存の購読があれば
+ * 二重に張らない。
+ */
+function ensureGlobalRealtimeSubscriptions(userId: string): void {
+  if (!unsubscribeFoldersRealtime) unsubscribeFoldersRealtime = subscribeFoldersRealtime(userId);
+  if (!unsubscribeNotesRealtime) unsubscribeNotesRealtime = subscribeNotesRealtime(userId);
+}
+
+/** サインアウト等でセッションが失われた際、folders/notesの常時購読も解除する */
+function teardownGlobalRealtimeSubscriptions(): void {
+  unsubscribeFoldersRealtime?.();
+  unsubscribeFoldersRealtime = null;
+  unsubscribeNotesRealtime?.();
+  unsubscribeNotesRealtime = null;
+}
 
 // ============================================================
 // Undo/Redo履歴
@@ -1774,23 +1803,37 @@ async function refreshCurrentNoteNodesFromRemote(noteId: string): Promise<void> 
   }
 }
 
+let refreshingFromRemote = false;
+
 /**
- * タブがバックグラウンドから復帰した際に、リモートとの差分を取り込みつつ
+ * タブ/ウィンドウがバックグラウンドから復帰した際に、リモートとの差分を取り込みつつ
  * 未送信キューもフラッシュして最新化する(起動時のinit()と同じ考え方を、
- * 復帰のたびにも軽く適用する)。
+ * 復帰のたびにも軽く適用する)。folders/notes一覧とnodesの取得はPromise.allで
+ * 並行に行うため、iPad PWAの復帰直後でも体感的に一瞬で最新化が終わる。
+ * visibilitychangeとwindow.onfocusがほぼ同時に発火しても二重に走らないよう、
+ * 実行中は多重起動をガードする。
  */
 async function refreshFromRemote(): Promise<void> {
+  if (refreshingFromRemote) return;
   const client = getSupabaseClient();
   const { userId, isOnline } = useOutlineStore.getState();
   if (!client || !userId || !isOnline) return;
 
-  console.log("[Sync] タブ復帰によるリモート差分の取得を開始します");
-  const state = useOutlineStore.getState();
-  await Promise.all([state.loadFolders(), state.loadNotesList()]);
-  const noteId = useOutlineStore.getState().currentNoteId;
-  if (noteId) await refreshCurrentNoteNodesFromRemote(noteId);
-  await flushPendingSync();
-  console.log("[Sync] タブ復帰によるリモート差分の取得が完了しました");
+  refreshingFromRemote = true;
+  try {
+    console.log("[Sync] 復帰によるリモート差分の取得を開始します");
+    const state = useOutlineStore.getState();
+    const noteId = state.currentNoteId;
+    await Promise.all([
+      state.loadFolders(),
+      state.loadNotesList(),
+      noteId ? refreshCurrentNoteNodesFromRemote(noteId) : Promise.resolve(),
+    ]);
+    await flushPendingSync();
+    console.log("[Sync] 復帰によるリモート差分の取得が完了しました");
+  } finally {
+    refreshingFromRemote = false;
+  }
 }
 
 /** ノート内の「1行目」(親を持たないルートノードのうち、positionが最小のもの)を探す */
@@ -1884,6 +1927,9 @@ async function connectSupabase(): Promise<boolean> {
     }
     console.log("[Sync] 匿名認証が完了しました。未送信分の同期キューを処理します userId=", userId);
     await flushPendingSync();
+    // PC⇄iPad間などの他端末での変更をリアルタイムに拾うため、folders/notesの
+    // 常時購読を開始する(画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
+    ensureGlobalRealtimeSubscriptions(userId);
     console.log("[Sync] Supabaseとの接続・認証が確定しました。ステータスを更新します");
     markSynced();
     return true;
@@ -2210,8 +2256,113 @@ function subscribeRealtime(noteId: string): () => void {
         // 自分の書き込みのエコーや古い変更で上書きしないようにする
         if (existing && existing.updatedAt >= incoming.updatedAt) return;
 
+        markKnownRemote("nodes", [incoming.id]);
         useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
         void dbPutNode(incoming);
+      }
+    )
+    .subscribe();
+
+  return () => {
+    void client.removeChannel(channel);
+  };
+}
+
+/**
+ * folders一覧全体を対象にしたリアルタイム購読(開いているメモに関わらず常時購読)。
+ * 別端末(PC等)でフォルダの追加・名前変更・移動・削除が行われた瞬間、画面全体を
+ * 再取得することなく、差分のあった1件だけをピンポイントでローカル(Zustand/
+ * IndexedDB)へ反映する。自分自身の書き込みが返ってきたエコーはupdatedAt比較で
+ * 検知してスキップする(nodesの購読と同じ仕組み)。
+ */
+function subscribeFoldersRealtime(userId: string): () => void {
+  const client = getSupabaseClient();
+  if (!client) return () => {};
+
+  const channel = client
+    .channel(`folders-${userId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "folders", filter: `user_id=eq.${userId}` },
+      (payload) => {
+        if (payload.eventType === "DELETE") {
+          const oldId = (payload.old as { id: string }).id;
+          useOutlineStore.setState((s) => {
+            if (!s.folders.some((f) => f.id === oldId)) return s;
+            return { folders: s.folders.filter((f) => f.id !== oldId) };
+          });
+          void dbDeleteFolderLocal(oldId);
+          console.log("[Sync] 他端末でフォルダが削除されました:", oldId);
+          return;
+        }
+
+        const incoming = folderFromRow(payload.new as FolderRowType);
+        const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
+        // 自分の書き込みのエコーや古い変更で上書きしないようにする
+        if (existing && existing.updatedAt >= incoming.updatedAt) return;
+
+        markKnownRemote("folders", [incoming.id]);
+        useOutlineStore.setState((s) => ({
+          folders: sortFolders(
+            existing ? s.folders.map((f) => (f.id === incoming.id ? incoming : f)) : [...s.folders, incoming]
+          ),
+        }));
+        void dbPutFolder(incoming);
+        console.log("[Sync] 他端末でのフォルダの変更を反映しました:", incoming.id);
+      }
+    )
+    .subscribe();
+
+  return () => {
+    void client.removeChannel(channel);
+  };
+}
+
+/**
+ * notes一覧全体を対象にしたリアルタイム購読(開いているメモに関わらず常時購読)。
+ * 別端末での新規作成・タイトル変更・フォルダ移動・削除を、差分のあった1件だけ
+ * ピンポイントでローカルへ反映する。今開いているメモ自体が他端末で削除された
+ * 場合は、安全のためメモを閉じる。
+ */
+function subscribeNotesRealtime(userId: string): () => void {
+  const client = getSupabaseClient();
+  if (!client) return () => {};
+
+  const channel = client
+    .channel(`notes-${userId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "notes", filter: `user_id=eq.${userId}` },
+      (payload) => {
+        if (payload.eventType === "DELETE") {
+          const oldId = (payload.old as { id: string }).id;
+          useOutlineStore.setState((s) => {
+            if (!s.notesList.some((n) => n.id === oldId)) return s;
+            return {
+              notesList: s.notesList.filter((n) => n.id !== oldId),
+              ...(s.currentNoteId === oldId
+                ? { currentNoteId: null, nodes: {}, activeNodeId: null }
+                : {}),
+            };
+          });
+          void dbDeleteNoteLocal(oldId);
+          console.log("[Sync] 他端末でメモが削除されました:", oldId);
+          return;
+        }
+
+        const incoming = noteFromRow(payload.new as NoteRowType);
+        const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
+        // 自分の書き込みのエコーや古い変更で上書きしないようにする
+        if (existing && existing.updatedAt >= incoming.updatedAt) return;
+
+        markKnownRemote("notes", [incoming.id]);
+        useOutlineStore.setState((s) => ({
+          notesList: sortNotes(
+            existing ? s.notesList.map((n) => (n.id === incoming.id ? incoming : n)) : [...s.notesList, incoming]
+          ),
+        }));
+        void dbPutNote(incoming);
+        console.log("[Sync] 他端末でのメモの変更を反映しました:", incoming.id);
       }
     )
     .subscribe();
