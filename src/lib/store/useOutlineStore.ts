@@ -348,6 +348,10 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       return;
     }
     const remoteFolders = (data ?? []).map(folderFromRow);
+    markKnownRemote(
+      "folders",
+      remoteFolders.map((f) => f.id)
+    );
     const merged = sortFolders(mergeByUpdatedAt(local, remoteFolders));
     await Promise.all(merged.map((f) => dbPutFolder(f)));
     set({ folders: merged });
@@ -369,6 +373,10 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       return;
     }
     const remoteNotes = (data ?? []).map(noteFromRow);
+    markKnownRemote(
+      "notes",
+      remoteNotes.map((n) => n.id)
+    );
     const merged = sortNotes(mergeByUpdatedAt(local, remoteNotes));
     await Promise.all(merged.map((n) => dbPutNote(n)));
     set({ notesList: merged });
@@ -407,6 +415,10 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       );
       if (!error && data) {
         const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
+        markKnownRemote(
+          "nodes",
+          remoteNodes.map((n) => n.id)
+        );
         const merged = mergeByUpdatedAt(Object.values(get().nodes), remoteNodes);
         await dbPutNodes(merged);
         if (get().currentNoteId === noteId) {
@@ -1387,53 +1399,168 @@ function isConflictError(message: string): boolean {
 }
 
 /**
- * 409 Conflict / 23505 (unique_violation) を絶対に表面化させないための安全なupsert。
- * 通常は upsert(rows, { onConflict: 'id', ignoreDuplicates: false }) でそのまま
- * (新規行はinsert・既存idの行は上書き)書き込めるが、ごくまれな競合(同一idへの
- * ほぼ同時書き込み等)で409/23505として返ってくることがある。その場合だけ、
- * 該当行を1件ずつ update().eq('id', id) にフォールバックして確実に反映させる
- * (これによりコンソールに409/23505エラーが出ることは無くなる)。
+ * テーブルごとに「Supabase上に既に存在するとわかっているid」を憶えておく、
+ * ページ滞在中だけ有効な軽量フラグ。サーバから取得できた行のid、insert/updateに
+ * 成功した行のidをここに積み、次にそのidを送るときはinsertではなくupdateを
+ * 選ぶ判定に使う(.upsert()を一切使わずにinsert/updateを明示的に振り分けるための土台)。
+ * 万一この判定を誤っても、safeWriteが逆操作へ自動フォールバックするため実害はない。
  */
-async function safeUpsert(
+const knownRemoteIds = new Map<SyncTable, Set<string>>();
+
+function markKnownRemote(table: SyncTable, ids: Iterable<string>): void {
+  let set = knownRemoteIds.get(table);
+  if (!set) {
+    set = new Set();
+    knownRemoteIds.set(table, set);
+  }
+  for (const id of ids) set.add(id);
+}
+
+function isKnownRemote(table: SyncTable, id: string): boolean {
+  return knownRemoteIds.get(table)?.has(id) ?? false;
+}
+
+/** 複数の新規行をまとめて1回のinsert([...])で送る(POSTリクエスト) */
+async function tryInsert(
   client: SupabaseClient,
   table: SyncTable,
   rows: Array<NodeRow | NoteRowType | FolderRowType>
 ): Promise<{ error: { message: string } | null }> {
   if (rows.length === 0) return { error: null };
+  return safeCall(() => client.from(table).insert(rows));
+}
 
-  const { error } = await safeCall(() =>
-    client.from(table).upsert(rows, { onConflict: "id", ignoreDuplicates: false })
-  );
-  if (!error) return { error: null };
-  if (!isConflictError(error.message)) return { error };
+/**
+ * 1件をupdate().eq('id', id)で送る(PATCHリクエスト)。PostgRESTはeq条件に一致する
+ * 行が無くてもエラーにはならず0件更新で成功扱いになるため、.select('id')を付けて
+ * 実際に更新された行があったかどうかを戻り値のdata件数で判定する
+ * (0件なら「実はまだ存在しなかった」とみなし、呼び出し元でinsertへフォールバックする)。
+ */
+async function tryUpdate(
+  client: SupabaseClient,
+  table: SyncTable,
+  id: string,
+  row: NodeRow | NoteRowType | FolderRowType
+): Promise<{ affected: boolean; error: { message: string } | null }> {
+  const { data, error } = await safeCall(() => client.from(table).update(row).eq("id", id).select("id"));
+  if (error) return { affected: false, error };
+  const affected = Array.isArray(data) && data.length > 0;
+  return { affected, error: null };
+}
 
-  console.log(`[Sync] ${table}で409/23505を検知したため、update()へフォールバックして再適用します`);
-  // バッチ全体を巻き込んで失敗させないよう、行ごとにupdateへフォールバックする
-  let firstError: { message: string } | null = null;
-  for (const row of rows) {
-    const id = row.id;
-    const { error: updateError } = await safeCall(() => client.from(table).update(row).eq("id", id));
-    if (updateError) {
-      devError(`[sync] ${table}(${id})のupdateフォールバックにも失敗しました:`, updateError.message);
-      firstError = firstError ?? updateError;
+/**
+ * .upsert()を一切使わず、既存/新規かをローカルの既知フラグ(knownRemoteIds)で判定して
+ * update または insert を明示的に発行する安全な1件書き込み。判定が誤っていた場合に
+ * 備えて、どちらの経路でも逆操作(insert⇄update)への自動フォールバックを行うため、
+ * ブラウザコンソールに409 Conflict / 23505 (unique_violation) が露出することは無い。
+ */
+async function safeWrite(
+  client: SupabaseClient,
+  table: SyncTable,
+  id: string,
+  row: NodeRow | NoteRowType | FolderRowType
+): Promise<{ error: { message: string } | null }> {
+  if (isKnownRemote(table, id)) {
+    const updated = await tryUpdate(client, table, id, row);
+    if (updated.affected) {
+      markKnownRemote(table, [id]);
+      return { error: null };
+    }
+    if (updated.error && !isConflictError(updated.error.message)) return { error: updated.error };
+
+    console.log(`[Sync] ${table}(${id})のupdateが不成立/衝突のため、insertへフォールバックします`);
+    const inserted = await tryInsert(client, table, [row]);
+    if (!inserted.error) {
+      markKnownRemote(table, [id]);
+      return { error: null };
+    }
+    // insertも失敗した(=実は既に存在していた等)なら、最後にもう一度updateを試す
+    console.log(`[Sync] ${table}(${id})のinsertフォールバックにも失敗。updateを再試行します:`, inserted.error.message);
+    const retried = await tryUpdate(client, table, id, row);
+    if (retried.affected) {
+      markKnownRemote(table, [id]);
+      return { error: null };
+    }
+    return { error: retried.error ?? inserted.error };
+  }
+
+  const inserted = await tryInsert(client, table, [row]);
+  if (!inserted.error) {
+    markKnownRemote(table, [id]);
+    return { error: null };
+  }
+  if (!isConflictError(inserted.error.message)) return { error: inserted.error };
+
+  console.log(`[Sync] ${table}(${id})のinsertが409/23505のため、updateへフォールバックします`);
+  const updated = await tryUpdate(client, table, id, row);
+  if (updated.affected) {
+    markKnownRemote(table, [id]);
+    return { error: null };
+  }
+  return { error: updated.error ?? inserted.error };
+}
+
+/**
+ * 指定テーブルの行群をinsert/updateへ明示的に振り分けて送信し、失敗したidの集合を返す。
+ * まだ存在しないとわかっている行はまとめて1回のinsert([...])で送る(通信回数を削減する
+ * 真のバッチ送信)。既に存在する行はupdate().eq('id', id)が1件=1リクエストという
+ * REST APIの制約上まとめて1回にはできないため、Promise.allで並列送信して待ち時間を縮める。
+ * .upsert()は一切使わず、失敗した行はsafeWrite内で逆操作へフォールバックするため、
+ * 409/23505がコンソールへ表面化することは無い。
+ */
+async function syncRowsToTable(
+  client: SupabaseClient,
+  table: SyncTable,
+  rows: Array<NodeRow | NoteRowType | FolderRowType>
+): Promise<Set<string>> {
+  const failedIds = new Set<string>();
+  const newRows = rows.filter((r) => !isKnownRemote(table, r.id));
+  const existingRows = rows.filter((r) => isKnownRemote(table, r.id));
+
+  if (newRows.length > 0) {
+    const { error } = await tryInsert(client, table, newRows);
+    if (!error) {
+      markKnownRemote(
+        table,
+        newRows.map((r) => r.id)
+      );
     } else {
-      console.log(`[Sync] ${table}(${id})をupdateフォールバックで復旧しました`);
+      console.log(`[Sync] ${table}の一括insertが失敗したため、1件ずつ再適用します:`, error.message);
+      for (const row of newRows) {
+        const result = await safeWrite(client, table, row.id, row);
+        if (result.error) {
+          devError(`[sync] ${table}(${row.id})の保存に失敗しました:`, result.error.message);
+          failedIds.add(row.id);
+        }
+      }
     }
   }
-  return { error: firstError };
+
+  if (existingRows.length > 0) {
+    const results = await Promise.all(existingRows.map((row) => safeWrite(client, table, row.id, row)));
+    results.forEach((result, i) => {
+      if (result.error) {
+        devError(`[sync] ${table}(${existingRows[i].id})の保存に失敗しました:`, result.error.message);
+        failedIds.add(existingRows[i].id);
+      }
+    });
+  }
+
+  return failedIds;
 }
 
 /**
  * Supabaseへの同期リクエストをテーブル単位でまとめて軽量化するバッチキュー。
  * persistNode/persistNote/persistFolderは呼ばれるたびに即座に通信するのではなく、
  * ここへ「そのidの最新の行データ」を積むだけにする。同じidに何度persistしても
- * キュー上では1件に上書きされる(=同一レコードへの連続編集が1回の送信に自然と
- * まとまる)うえ、SYNC_DEBOUNCE_MS(1000ms)待って複数idをまとめて1回のupsertで
- * 送るため、通信回数・データ量の両方を最小限に抑えられる。
+ * キュー上では1件に上書きされ、SYNC_DEBOUNCE_MS(1000ms)そのidへの追加編集が
+ * 無ければ送信される(id単位のデバウンス)。発火時にはその時点でテーブルに
+ * 溜まっている他のidも巻き込んでまとめて送るため、複数レコードを編集した場合も
+ * 機会があれば1回の送信にまとまる。
  */
 const SYNC_DEBOUNCE_MS = 1000;
 const pendingSyncRows = new Map<SyncTable, Map<string, NodeRow | NoteRowType | FolderRowType>>();
-const syncFlushTimers = new Map<SyncTable, ReturnType<typeof setTimeout>>();
+const syncFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function queueRowForSync(table: SyncTable, id: string, row: NodeRow | NoteRowType | FolderRowType): void {
   let tableQueue = pendingSyncRows.get(table);
@@ -1443,18 +1570,21 @@ function queueRowForSync(table: SyncTable, id: string, row: NodeRow | NoteRowTyp
   }
   tableQueue.set(id, row);
 
-  const existingTimer = syncFlushTimers.get(table);
+  // デバウンスはid単位: 同じidへの連続編集は1回に集約しつつ、無関係な他のidの送信が
+  // ずっと編集され続ける1件によって際限なく遅延させられる(=飢餓状態になる)ことを防ぐ
+  const timerKey = `${table}:${id}`;
+  const existingTimer = syncFlushTimers.get(timerKey);
   if (existingTimer) clearTimeout(existingTimer);
   syncFlushTimers.set(
-    table,
+    timerKey,
     setTimeout(() => {
-      syncFlushTimers.delete(table);
+      syncFlushTimers.delete(timerKey);
       void flushTableQueue(table);
     }, SYNC_DEBOUNCE_MS)
   );
 }
 
-/** キューに溜まった特定テーブルの全行を、1回のバッチupsertでまとめて送信する */
+/** キューに溜まった特定テーブルの全行を、insert/updateへ振り分けてまとめて送信する */
 async function flushTableQueue(table: SyncTable): Promise<void> {
   const tableQueue = pendingSyncRows.get(table);
   if (!tableQueue || tableQueue.size === 0) return;
@@ -1472,14 +1602,14 @@ async function flushTableQueue(table: SyncTable): Promise<void> {
   }
 
   console.log(`[Sync] ${table}をバッチ送信します (${rows.length}件, id=${ids.join(",")})`);
-  const { error } = await safeUpsert(client, table, rows);
-  if (error) {
-    devError(`[sync] ${table}のバッチ送信に失敗しました:`, error.message);
-    console.log(`[Sync] ${table}のバッチ送信が失敗しました:`, error.message);
-    await Promise.all(ids.map((id) => dbMarkDirty(table, id)));
+  const failedIds = await syncRowsToTable(client, table, rows);
+  const succeededIds = ids.filter((id) => !failedIds.has(id));
+  if (succeededIds.length > 0) await Promise.all(succeededIds.map((id) => dbClearDirty(table, id)));
+  if (failedIds.size > 0) {
+    console.log(`[Sync] ${table}のバッチ送信で失敗した行があります:`, Array.from(failedIds).join(","));
+    await Promise.all(Array.from(failedIds).map((id) => dbMarkDirty(table, id)));
     useOutlineStore.setState({ syncStatus: "error" });
   } else {
-    await Promise.all(ids.map((id) => dbClearDirty(table, id)));
     markSynced();
   }
 }
@@ -1848,11 +1978,11 @@ export async function flushPendingSync(): Promise<void> {
     if (missingIds.length > 0) await Promise.all(missingIds.map((id) => dbClearDirty(table, id)));
     if (rows.length === 0) continue;
 
-    const { error } = await safeUpsert(client, table, rows);
-    if (!error) {
-      await Promise.all(rows.map((r) => dbClearDirty(table, r.id)));
-    } else {
-      devError(`[sync] ${table}のバッチ再送に失敗しました:`, error.message);
+    const failedIds = await syncRowsToTable(client, table, rows);
+    const succeededIds = rows.map((r) => r.id).filter((id) => !failedIds.has(id));
+    if (succeededIds.length > 0) await Promise.all(succeededIds.map((id) => dbClearDirty(table, id)));
+    if (failedIds.size > 0) {
+      console.log(`[Sync] ${table}のバッチ再送で失敗した行があります:`, Array.from(failedIds).join(","));
     }
   }
 

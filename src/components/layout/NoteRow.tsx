@@ -90,6 +90,11 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
             href={`/notes/${note.id}`}
             onClick={handleNoteClick}
             onContextMenu={(e) => e.preventDefault()}
+            // <a>は既定でブラウザのネイティブドラッグ(リンクのつまみ出し)が有効なため、
+            // 何も指定しないとマウスでの独自ドラッグ検出(useRowDragのしきい値判定)と
+            // 競合してうまく発火しないことがある。ここで明示的に無効化しておく。
+            draggable={false}
+            onDragStart={(e) => e.preventDefault()}
             className={clsx(
               "flex min-w-0 flex-1 items-center gap-2 rounded-lg py-2.5 pl-2 pr-1 text-base",
               highlighted ? SELECTED_TEXT_CLASS : "text-ink-700"
