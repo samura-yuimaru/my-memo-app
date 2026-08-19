@@ -299,6 +299,25 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
         console.log("[Sync] オフラインになりました");
         useOutlineStore.setState({ isOnline: false, syncStatus: "offline" });
       });
+
+      // タブが非表示になる(他タブへ切替・画面ロック等)瞬間、デバウンス待ちのタイマーを
+      // 待たずに保留中の変更を即座に送信する(書き損じ防止)。逆に、タブが再び前面に
+      // 戻ってきた(フォーカス復帰)瞬間には、他端末での変更を取りこぼさないよう
+      // リモートとの差分を取得し直し、ついでに未送信キューもフラッシュする。
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") {
+          console.log("[Sync] タブが非表示になったため、保留中の変更を即時送信します");
+          flushAllPendingSync();
+        } else if (document.visibilityState === "visible") {
+          console.log("[Sync] タブが復帰したため、最新化します");
+          void refreshFromRemote();
+        }
+      });
+      // ページを閉じる/リロードする直前にも、可能な範囲で即座に送信を試みる
+      // (visibilitychangeの"hidden"が先に発火するのが通常だが、保険として二重に構える)
+      window.addEventListener("beforeunload", () => {
+        flushAllPendingSync();
+      });
     }
 
     const client = getSupabaseClient();
@@ -1501,6 +1520,22 @@ async function safeWrite(
 }
 
 /**
+ * notesのfolder_idが現在のfolders一覧に存在しない(フォルダが削除された・
+ * 別端末側の変更がまだ反映されていない等)場合、外部キー制約違反
+ * (notes_folder_id_fkey)を未然に防ぐため、送信直前にnull(フォルダなし/
+ * ルート階層)へ自動的に補正する。
+ */
+function sanitizeNoteRowFolderRef(row: NoteRowType): NoteRowType {
+  if (!row.folder_id) return row;
+  const exists = useOutlineStore.getState().folders.some((f) => f.id === row.folder_id);
+  if (exists) return row;
+  console.log(
+    `[Sync] notes(${row.id})のfolder_id=${row.folder_id}が現在のfolders一覧に存在しないため、nullへ補正します`
+  );
+  return { ...row, folder_id: null };
+}
+
+/**
  * 指定テーブルの行群をinsert/updateへ明示的に振り分けて送信し、失敗したidの集合を返す。
  * まだ存在しないとわかっている行はまとめて1回のinsert([...])で送る(通信回数を削減する
  * 真のバッチ送信)。既に存在する行はupdate().eq('id', id)が1件=1リクエストという
@@ -1514,8 +1549,11 @@ async function syncRowsToTable(
   rows: Array<NodeRow | NoteRowType | FolderRowType>
 ): Promise<Set<string>> {
   const failedIds = new Set<string>();
-  const newRows = rows.filter((r) => !isKnownRemote(table, r.id));
-  const existingRows = rows.filter((r) => isKnownRemote(table, r.id));
+  // notesはFK制約(notes_folder_id_fkey)違反を未然に防ぐため、送信直前に補正しておく
+  const sanitizedRows =
+    table === "notes" ? (rows as NoteRowType[]).map(sanitizeNoteRowFolderRef) : rows;
+  const newRows = sanitizedRows.filter((r) => !isKnownRemote(table, r.id));
+  const existingRows = sanitizedRows.filter((r) => isKnownRemote(table, r.id));
 
   if (newRows.length > 0) {
     const { error } = await tryInsert(client, table, newRows);
@@ -1553,12 +1591,16 @@ async function syncRowsToTable(
  * Supabaseへの同期リクエストをテーブル単位でまとめて軽量化するバッチキュー。
  * persistNode/persistNote/persistFolderは呼ばれるたびに即座に通信するのではなく、
  * ここへ「そのidの最新の行データ」を積むだけにする。同じidに何度persistしても
- * キュー上では1件に上書きされ、SYNC_DEBOUNCE_MS(1000ms)そのidへの追加編集が
- * 無ければ送信される(id単位のデバウンス)。発火時にはその時点でテーブルに
- * 溜まっている他のidも巻き込んでまとめて送るため、複数レコードを編集した場合も
- * 機会があれば1回の送信にまとまる。
+ * キュー上では1件に上書きされ、編集が止まってからSYNC_DEBOUNCE_MS(3000ms)その
+ * idへの追加編集が無ければ送信される(id単位のデバウンス)。発火時にはその時点で
+ * テーブルに溜まっている他のidも巻き込んでまとめて送るため、複数レコードを
+ * 編集した場合も機会があれば1回の送信にまとまる。タブ離脱時はflushAllPendingSyncが
+ * このタイマーを待たずに即時フラッシュする。
  */
-const SYNC_DEBOUNCE_MS = 1000;
+/** 編集が完全に止まってからこの時間が経つまでは通信しない(操作停止から3秒後の
+ *  自動バッチ同期)。タブを離れる/閉じる場合はこのタイマーを待たずflushAllPendingSyncで
+ *  即時送信されるため、体感の遅延なく取りこぼしも防げる。 */
+const SYNC_DEBOUNCE_MS = 3000;
 const pendingSyncRows = new Map<SyncTable, Map<string, NodeRow | NoteRowType | FolderRowType>>();
 const syncFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -1612,6 +1654,78 @@ async function flushTableQueue(table: SyncTable): Promise<void> {
   } else {
     markSynced();
   }
+}
+
+/**
+ * デバウンス待ちの全テーブルの保留中キューを、タイマーを待たずに今すぐ送信する。
+ * タブが非表示になる/閉じられる直前に呼び、3秒デバウンスの間に発生した「まだ
+ * 送信していない編集」が失われる(次にタブを開くまで未送信のまま)ことを防ぐ。
+ * fire-and-forgetで呼ぶ想定(unload系のイベントハンドラは完了を待てないため)。
+ */
+function flushAllPendingSync(): void {
+  const tables = Array.from(pendingSyncRows.keys()).filter((table) => (pendingSyncRows.get(table)?.size ?? 0) > 0);
+  if (tables.length === 0) return;
+  console.log("[Sync] 保留中の同期キューを即時フラッシュします:", tables.join(","));
+  for (const table of tables) {
+    // このテーブルのidに紐づくデバウンスタイマーは、これから即時flushするため不要になる
+    for (const timerKey of Array.from(syncFlushTimers.keys())) {
+      if (timerKey.startsWith(`${table}:`)) {
+        clearTimeout(syncFlushTimers.get(timerKey));
+        syncFlushTimers.delete(timerKey);
+      }
+    }
+    void flushTableQueue(table);
+  }
+}
+
+/**
+ * 現在開いているメモのノードだけを対象に、リモートの最新状態を取得してローカルへ
+ * マージする(openNoteと違い、undo履歴やフォーカス状態はリセットしない)。
+ * タブがバックグラウンドから復帰した際、他端末での変更を取りこぼさないために使う。
+ */
+async function refreshCurrentNoteNodesFromRemote(noteId: string): Promise<void> {
+  const client = getSupabaseClient();
+  const { userId } = useOutlineStore.getState();
+  if (!client || !userId) return;
+
+  const { data, error } = await safeCall(() => client.from("nodes").select("*").eq("note_id", noteId));
+  if (error) {
+    devError("[sync] ノードの再取得に失敗しました:", error.message);
+    return;
+  }
+  if (!data) return;
+  const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
+  markKnownRemote(
+    "nodes",
+    remoteNodes.map((n) => n.id)
+  );
+  // タブが非表示だった間に別のメモへ遷移していた場合は反映しない
+  if (useOutlineStore.getState().currentNoteId !== noteId) return;
+  const merged = mergeByUpdatedAt(Object.values(useOutlineStore.getState().nodes), remoteNodes);
+  await dbPutNodes(merged);
+  if (useOutlineStore.getState().currentNoteId === noteId) {
+    useOutlineStore.setState({ nodes: toMap(merged) });
+    maybeAutoTitleFromFirstNode(noteId, useOutlineStore.getState().nodes);
+  }
+}
+
+/**
+ * タブがバックグラウンドから復帰した際に、リモートとの差分を取り込みつつ
+ * 未送信キューもフラッシュして最新化する(起動時のinit()と同じ考え方を、
+ * 復帰のたびにも軽く適用する)。
+ */
+async function refreshFromRemote(): Promise<void> {
+  const client = getSupabaseClient();
+  const { userId, isOnline } = useOutlineStore.getState();
+  if (!client || !userId || !isOnline) return;
+
+  console.log("[Sync] タブ復帰によるリモート差分の取得を開始します");
+  const state = useOutlineStore.getState();
+  await Promise.all([state.loadFolders(), state.loadNotesList()]);
+  const noteId = useOutlineStore.getState().currentNoteId;
+  if (noteId) await refreshCurrentNoteNodesFromRemote(noteId);
+  await flushPendingSync();
+  console.log("[Sync] タブ復帰によるリモート差分の取得が完了しました");
 }
 
 /** ノート内の「1行目」(親を持たないルートノードのうち、positionが最小のもの)を探す */
