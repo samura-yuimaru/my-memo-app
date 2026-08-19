@@ -176,6 +176,7 @@ export function Sidebar({ onNavigate }: SidebarProps) {
                     active={currentNoteId === note.id}
                     onOpen={() => openNote(note.id)}
                     onDelete={(e) => void handleDeleteNote(e, note.id, note.title)}
+                    ancestorHighlighted={dropTarget === "unfiled"}
                   />
                 ))}
               </ul>

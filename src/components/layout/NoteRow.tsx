@@ -15,6 +15,13 @@ interface NoteRowProps {
   active: boolean;
   onOpen: () => void;
   onDelete: (e: React.MouseEvent) => void;
+  /**
+   * 親フォルダ(のいずれかの祖先)が現在ドロップ対象としてハイライトされているか。
+   * ドロップ対象の水色ハイライトはフォルダの中身全体に及ぶため、その上に乗る
+   * メモの文字色もFolderNodeと同じSELECTED_TEXT_CLASSに揃える(ダークモードで
+   * ink-700の明るい文字が水色背景に埋もれて読めなくなるのを防ぐ)。
+   */
+  ancestorHighlighted?: boolean;
 }
 
 /**
@@ -22,7 +29,7 @@ interface NoteRowProps {
  * useRowDragフック)。長押しして指を動かさずに離すと、その場でメモ名を変更できる
  * (iOSのリンクプレビューは発動しないよう抑止している)。
  */
-export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
+export function NoteRow({ note, active, onOpen, onDelete, ancestorHighlighted = false }: NoteRowProps) {
   const { draggingItem, startDragNote } = useSidebarDnd();
   const renameNote = useOutlineStore((s) => s.renameNote);
   const isDragging = draggingItem?.type === "note" && draggingItem.id === note.id;
@@ -53,7 +60,7 @@ export function NoteRow({ note, active, onOpen, onDelete }: NoteRowProps) {
     onOpen();
   }
 
-  const highlighted = active;
+  const highlighted = active || ancestorHighlighted;
 
   return (
     <li className="group/actions">

@@ -21,6 +21,14 @@ interface FolderNodeProps {
   onOpenNote: (id: string) => void;
   onDeleteNote: (e: React.MouseEvent, id: string, title: string) => void;
   onNewNote: (folderId: string) => void;
+  /**
+   * 祖先フォルダ(自分を含む階層のどこか上)が現在ドロップ対象としてハイライトされて
+   * いるかどうか。ドロップ対象の水色ハイライトは対象フォルダの中身全体(配下の
+   * サブフォルダ・メモも含む)に及ぶため、そこに含まれるすべての行の文字色を
+   * SELECTED_TEXT_CLASSに揃えないと、ダークモードでink-700(明るい色)の文字が
+   * 水色背景に埋もれて読めなくなる。これを子孫へ伝播させるためのフラグ。
+   */
+  ancestorHighlighted?: boolean;
 }
 
 /** 1階層あたりの字下げ幅。「1段下がった」ことがひと目でわかるよう、ツリーガイド線とあわせて広めに取る */
@@ -36,6 +44,7 @@ export function FolderNode({
   onOpenNote,
   onDeleteNote,
   onNewNote,
+  ancestorHighlighted = false,
 }: FolderNodeProps) {
   const renameFolder = useOutlineStore((s) => s.renameFolder);
   const deleteFolder = useOutlineStore((s) => s.deleteFolder);
@@ -52,6 +61,9 @@ export function FolderNode({
     .sort((a, b) => a.position - b.position);
   const notes = notesList.filter((n) => (n.folderId ?? null) === folder.id);
   const isDropTarget = dropTarget === folder.id;
+  // 自分自身がドロップ対象、または祖先フォルダがドロップ対象のハイライト中(=自分も
+  // その水色背景の上に乗っている)なら、フォルダ・メモどちらも同じ文字色にする
+  const highlighted = isDropTarget || ancestorHighlighted;
   const isDraggingSelf = draggingItem?.type === "folder" && draggingItem.id === folder.id;
   const isEmpty = childFolders.length === 0 && notes.length === 0;
 
@@ -120,7 +132,7 @@ export function FolderNode({
               title={collapsed ? "展開する" : "折りたたむ"}
               className={clsx(
                 "flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink-100",
-                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-400"
+                highlighted ? SELECTED_TEXT_CLASS : "text-ink-400"
               )}
             >
               <ChevronRight size={16} className={clsx("transition-transform", !collapsed && "rotate-90")} />
@@ -158,7 +170,7 @@ export function FolderNode({
               title={folder.name}
               className={clsx(
                 "flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left text-base font-medium hover:bg-ink-100",
-                isDropTarget ? SELECTED_TEXT_CLASS : "text-ink-700"
+                highlighted ? SELECTED_TEXT_CLASS : "text-ink-700"
               )}
             >
               <Folder size={16} className="shrink-0 opacity-70" aria-hidden="true" />
@@ -173,7 +185,7 @@ export function FolderNode({
               label="フォルダの操作"
               size="sm"
               onClick={() => setMenuOpen((v) => !v)}
-              className={clsx(isDropTarget && SELECTED_TEXT_CLASS, actionIconClass(menuOpen || editing || isDropTarget))}
+              className={clsx(highlighted && SELECTED_TEXT_CLASS, actionIconClass(menuOpen || editing || highlighted))}
             >
               <MoreHorizontal size={16} />
             </IconButton>
@@ -231,6 +243,7 @@ export function FolderNode({
                 onOpenNote={onOpenNote}
                 onDeleteNote={onDeleteNote}
                 onNewNote={onNewNote}
+                ancestorHighlighted={highlighted}
               />
             ))}
             {/* 空フォルダは中身の<ul>ごと出さない(無駄な余白を作らない)。ドロップ可能かどうかは
@@ -244,6 +257,7 @@ export function FolderNode({
                     active={currentNoteId === note.id}
                     onOpen={() => onOpenNote(note.id)}
                     onDelete={(e) => onDeleteNote(e, note.id, note.title)}
+                    ancestorHighlighted={highlighted}
                   />
                 ))}
               </ul>

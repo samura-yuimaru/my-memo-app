@@ -340,6 +340,17 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       window.addEventListener("beforeunload", () => {
         flushAllPendingSync();
       });
+
+      // タイムアウトや一時的な通信障害で送信できなかった変更(dirtyのまま残っている分)を、
+      // ユーザー操作やタブの表示/非表示の遷移が起きなくても自動的に拾い直すための
+      // 定期バックグラウンドリトライ。画面を止めることなく静かに再試行し続ける。
+      window.setInterval(() => {
+        const s = useOutlineStore.getState();
+        if (s.isOnline && s.userId && s.pendingCount > 0) {
+          console.log("[Sync] バックグラウンド定期リトライを実行します(未送信", s.pendingCount, "件)");
+          void flushPendingSync();
+        }
+      }, BACKGROUND_RETRY_INTERVAL_MS);
     }
 
     const client = getSupabaseClient();
@@ -1413,7 +1424,7 @@ function toMap(nodes: OutlineNodeData[]): Record<string, OutlineNodeData> {
  * 続けることになり、コンソールには何のエラーも出ないのに同期状態(syncStatus)が
  * "saving"のまま永遠に遷移しない、という診断しづらい停滞を招く。
  */
-const SUPABASE_CALL_TIMEOUT_MS = 10000;
+const SUPABASE_CALL_TIMEOUT_MS = 5000;
 
 async function safeCall<F extends () => PromiseLike<{ error: { message: string } | null }>>(
   fn: F
@@ -1620,6 +1631,8 @@ async function syncRowsToTable(
  *  自動バッチ同期)。タブを離れる/閉じる場合はこのタイマーを待たずflushAllPendingSyncで
  *  即時送信されるため、体感の遅延なく取りこぼしも防げる。 */
 const SYNC_DEBOUNCE_MS = 3000;
+/** タイムアウト等で送れなかった変更を、ユーザー操作が無くても自動的に拾い直す間隔 */
+const BACKGROUND_RETRY_INTERVAL_MS = 8000;
 const pendingSyncRows = new Map<SyncTable, Map<string, NodeRow | NoteRowType | FolderRowType>>();
 const syncFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -1645,8 +1658,33 @@ function queueRowForSync(table: SyncTable, id: string, row: NodeRow | NoteRowTyp
   );
 }
 
+/**
+ * テーブル間の外部キー依存順序: notesはfolder_idでfolders、nodesはnote_idでnotesを
+ * 参照する。新しいフォルダへ作成直後のメモを移動したり、新規メモ作成直後にその
+ * 1行目ノードを編集したりした場合、参照先(親)がまだリモートに存在しないまま
+ * 子を送ってしまうと外部キー制約違反になる。それを防ぐため、子テーブルを
+ * flushする前に親テーブル側の保留中キューがあれば必ず先にflush(完了を保証)する。
+ */
+const SYNC_TABLE_DEPENDS_ON: Partial<Record<SyncTable, SyncTable>> = {
+  notes: "folders",
+  nodes: "notes",
+};
+
 /** キューに溜まった特定テーブルの全行を、insert/updateへ振り分けてまとめて送信する */
 async function flushTableQueue(table: SyncTable): Promise<void> {
+  // 親テーブル(folders→notes→nodes)の保留分が残っていれば、直列に先に完了させる
+  const dependsOn = SYNC_TABLE_DEPENDS_ON[table];
+  if (dependsOn && (pendingSyncRows.get(dependsOn)?.size ?? 0) > 0) {
+    console.log(`[Sync] ${table}の送信前に、依存先の${dependsOn}を先に同期します`);
+    for (const timerKey of Array.from(syncFlushTimers.keys())) {
+      if (timerKey.startsWith(`${dependsOn}:`)) {
+        clearTimeout(syncFlushTimers.get(timerKey));
+        syncFlushTimers.delete(timerKey);
+      }
+    }
+    await flushTableQueue(dependsOn);
+  }
+
   const tableQueue = pendingSyncRows.get(table);
   if (!tableQueue || tableQueue.size === 0) return;
   const ids = Array.from(tableQueue.keys());
@@ -1667,9 +1705,15 @@ async function flushTableQueue(table: SyncTable): Promise<void> {
   const succeededIds = ids.filter((id) => !failedIds.has(id));
   if (succeededIds.length > 0) await Promise.all(succeededIds.map((id) => dbClearDirty(table, id)));
   if (failedIds.size > 0) {
-    console.log(`[Sync] ${table}のバッチ送信で失敗した行があります:`, Array.from(failedIds).join(","));
+    // タイムアウトや一時的な通信障害でも、画面を「同期エラー」や「同期中…」のまま
+    // 固まらせない。syncStatusを"idle"へ戻すことでAutosaveIndicatorの表示は
+    // pendingCount(このあとdirty化する分)を見た「同期中…(送信待ちN件)」表示へ
+    // フォールバックし、バックグラウンドの定期リトライ・オンライン復帰・タブ復帰時に
+    // 自動的に再送される(dirtyのまま残すのでデータが失われることは無い)。
+    console.log(`[Sync] ${table}のバッチ送信で失敗した行があります(バックグラウンドで再試行します):`, Array.from(failedIds).join(","));
     await Promise.all(Array.from(failedIds).map((id) => dbMarkDirty(table, id)));
-    useOutlineStore.setState({ syncStatus: "error" });
+    useOutlineStore.setState({ syncStatus: "idle" });
+    void refreshPendingCount();
   } else {
     markSynced();
   }
@@ -2089,7 +2133,11 @@ export async function flushPendingSync(): Promise<void> {
     list.push(d.recordId);
     dirtyByTable.set(d.table, list);
   }
-  for (const [table, ids] of dirtyByTable) {
+  // folders→notes→nodesの依存順で送る(notes.folder_id/nodes.note_idの外部キーが
+  // まだリモートに存在しない参照先を先に送ってしまい、制約違反になるのを防ぐ)
+  for (const table of ["folders", "notes", "nodes"] as const) {
+    const ids = dirtyByTable.get(table);
+    if (!ids || ids.length === 0) continue;
     let rows: Array<NodeRow | NoteRowType | FolderRowType>;
     if (table === "nodes") {
       const found = await Promise.all(ids.map((id) => dbGetNode(id)));
