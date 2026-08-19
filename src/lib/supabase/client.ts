@@ -20,8 +20,11 @@ export function isSupabaseConfigured(): boolean {
  *   クライアントコードに一切含めない)。実際のデータ保護は各テーブルのRLSポリシー
  *   (auth.uid() = user_id)で行う。
  * - 環境変数の値そのもの(URL・キー)は、エラー時も含めて絶対にconsoleへ出力しない。
- * - detectSessionInUrl は無効化している(このアプリはOAuthリダイレクトを使わず匿名認証のみのため、
- *   URLからセッション情報を解析する経路自体を塞いで攻撃面を減らす)。
+ * - detectSessionInUrl は無効化している(このアプリはOAuthリダイレクトを使わずメール+パスワード
+ *   認証のみのため、URLからセッション情報を解析する経路自体を塞いで攻撃面を減らす)。
+ * - persistSession: true により、ログインセッション(JWT/Refresh Token)はブラウザの
+ *   localStorageへ保存される。autoRefreshToken: trueと合わせて、明示的にログアウトしない限り
+ *   アプリを閉じても長期間(Refresh Tokenが有効な間、通常は数ヶ月単位)自動ログイン状態が続く。
  */
 export function getSupabaseClient(): SupabaseClient | null {
   if (cachedClient !== undefined) return cachedClient;

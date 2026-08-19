@@ -30,7 +30,12 @@ import {
 } from "@/lib/utils/tree";
 import type { RealtimeChannel, RealtimePostgresChangesPayload, SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
-import { ensureAnonymousSession } from "@/lib/supabase/auth";
+import {
+  getExistingSession,
+  signInWithEmail,
+  signOut as authSignOut,
+  signUpWithEmail,
+} from "@/lib/supabase/auth";
 import {
   folderFromRow,
   folderToRow,
@@ -117,6 +122,11 @@ interface OutlineState {
   reconnecting: boolean;
   /** Supabaseへまだ送信できていないローカルの変更・削除の件数(IndexedDBのdirty/pendingDeletesの合計) */
   pendingCount: number;
+  /** 起動時の既存セッション確認が完了したかどうか。falseの間はログイン画面を出さず待機する
+   *  (ログイン済みなのに一瞬ログイン画面がちらつくのを防ぐ) */
+  authChecked: boolean;
+  /** ログイン/新規登録フォームの送信中かどうか(ボタンの多重押下防止) */
+  authenticating: boolean;
 
   folders: FolderData[];
   notesList: NoteData[];
@@ -207,12 +217,19 @@ interface OutlineState {
 
   /**
    * Supabaseへの手動再接続(データ保護ステータスのモーダルの「再試行」ボタンから呼ぶ)。
-   * 匿名サインインをやり直し、成功したら同期キューの強制処理・フォルダ/メモ一覧の再取得・
-   * 開いているメモの再購読までまとめて行う。
+   * 既存セッションを確認し直し、有効なら同期キューの強制処理・フォルダ/メモ一覧の再取得まで
+   * まとめて行う(セッション自体が無い場合はログインが必要)。
    */
   reconnectSupabase: () => Promise<boolean>;
   /** 未送信の変更・削除件数(pendingCount)を再計算する。データ保護ステータスの表示更新に使う */
   refreshPendingCount: () => Promise<void>;
+
+  /** メール+パスワードでログインする。成功したらそのアカウントのfolders/notesを取得して反映する */
+  signIn: (email: string, password: string) => Promise<{ error: string | null }>;
+  /** メール+パスワードで新規アカウントを作成する(プロジェクト設定次第でメール確認が必要) */
+  signUp: (email: string, password: string) => Promise<{ error: string | null; needsEmailConfirmation: boolean }>;
+  /** ログアウトする。Realtime購読を止め、ログイン画面へ戻す(端末内のローカルデータは消さない) */
+  signOut: () => Promise<void>;
 }
 
 function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): OutlineNodeData {
@@ -279,6 +296,8 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   lastSyncedAt: null,
   reconnecting: false,
   pendingCount: 0,
+  authChecked: false,
+  authenticating: false,
 
   folders: [],
   notesList: [],
@@ -312,7 +331,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       window.addEventListener("online", () => {
         console.log("[Sync] オンラインに復帰しました");
         useOutlineStore.setState({ isOnline: true });
-        // オンライン復帰時: まだ認証できていなければ匿名サインインからやり直し、
+        // オンライン復帰時: まだ接続できていなければ既存セッションの確認からやり直し、
         // 既に認証済みならそのまま未送信分をまとめて送る
         if (!useOutlineStore.getState().userId) void connectSupabase();
         else void flushPendingSync();
@@ -362,28 +381,38 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
     const client = getSupabaseClient();
     if (client) {
-      // セッションが失効(トークンリフレッシュ失敗・サインアウト等)した場合に自動で
-      // 再認証を試みる、安全な再接続フロー。SupabaseのSDKがトークン更新も自動で
-      // 行うが(autoRefreshToken)、それでも失われた場合の最終防御線としてここで検知する。
+      // セッションが失効(トークンリフレッシュ失敗・明示的なサインアウト等)した場合を検知する。
+      // 匿名認証は廃止したため、SIGNED_OUT時に自動で再認証はしない(ログイン画面を表示する)。
       client.auth.onAuthStateChange((event, session) => {
         console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
           teardownSyncChannel();
           useOutlineStore.setState({ userId: null });
-          void connectSupabase();
           return;
         }
-        if (event === "TOKEN_REFRESHED" || event === "SIGNED_IN" || event === "USER_UPDATED") {
+        if (event === "SIGNED_IN" && session?.user.id) {
+          void completeAuthentication(session.user.id);
+          return;
+        }
+        if (event === "TOKEN_REFRESHED" || event === "USER_UPDATED") {
           useOutlineStore.setState({ userId: session?.user.id ?? null });
         }
       });
     }
 
-    // 起動時: 匿名サインイン(リトライ付き)→ 成功したら即座に未送信分の同期キューを処理する
+    // 起動時: 既に有効なセッション(=ログイン済み)があるかだけを確認する。
+    // 無ければ新規にサインインさせたりはしない(PC/iPad間で同じアカウントを共有する
+    // ため、匿名認証は廃止しており、ログイン画面から明示的にログインしてもらう)。
     if (client) {
-      console.log("[Sync] Supabaseへの接続(匿名認証)を開始します");
-      await connectSupabase();
+      console.log("[Sync] 既存セッションの確認を開始します");
+      const session = await getExistingSession();
+      if (session) {
+        await completeAuthentication(session.user.id);
+      } else {
+        console.log("[Sync] 有効なセッションが無いため、ログイン画面を表示します");
+      }
     }
+    set({ authChecked: true });
 
     console.log("[Sync] フォルダ/メモ一覧の読み込みを開始します");
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
@@ -1266,6 +1295,45 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     await refreshPendingCount();
   },
 
+  signIn: async (email, password) => {
+    if (get().authenticating) return { error: "処理中です" };
+    set({ authenticating: true });
+    try {
+      const { session, error } = await signInWithEmail(email, password);
+      if (error || !session) return { error: error ?? "ログインに失敗しました" };
+      await completeAuthentication(session.user.id);
+      await Promise.all([get().loadFolders(), get().loadNotesList()]);
+      return { error: null };
+    } finally {
+      set({ authenticating: false });
+    }
+  },
+
+  signUp: async (email, password) => {
+    if (get().authenticating) return { error: "処理中です", needsEmailConfirmation: false };
+    set({ authenticating: true });
+    try {
+      const { session, error, needsEmailConfirmation } = await signUpWithEmail(email, password);
+      if (error) return { error, needsEmailConfirmation: false };
+      if (needsEmailConfirmation || !session) {
+        return { error: null, needsEmailConfirmation: true };
+      }
+      await completeAuthentication(session.user.id);
+      await Promise.all([get().loadFolders(), get().loadNotesList()]);
+      return { error: null, needsEmailConfirmation: false };
+    } finally {
+      set({ authenticating: false });
+    }
+  },
+
+  signOut: async () => {
+    console.log("[Sync] ログアウトします");
+    teardownSyncChannel();
+    await authSignOut();
+    // 端末内のローカルデータ(IndexedDB)はそのまま残す。再ログインすればまた見える。
+    set({ userId: null, syncStatus: "idle" });
+  },
+
   exportSnapshot: async () => {
     const [folders, notes, nodes] = await Promise.all([
       dbGetAllFolders(),
@@ -2052,9 +2120,30 @@ async function refreshPendingCount(): Promise<void> {
 }
 
 /**
- * Supabaseへの接続(匿名サインイン)を確立し、成功したら未送信分の同期キューを
- * 即座に処理する。起動時・オンライン復帰時・手動再接続ボタンのすべてから呼ばれる
- * 共通の入口(二重実行は`reconnecting`フラグで防ぐ)。
+ * Supabaseへの接続(既存セッションの確認)を確立し、成功したら未送信分の同期キューを
+ * 即座に処理する。オンライン復帰時・手動再接続ボタンから呼ばれる共通の入口
+ * (二重実行は`reconnecting`フラグで防ぐ)。
+ */
+/**
+ * 認証が確立した(ログイン成功・既存セッション発見・トークン再取得)直後に必ず行う
+ * 共通処理: userIdを確定し、未送信分の同期キューを処理し、folders/notes/nodesを
+ * まとめた単一Realtimeチャンネルの購読を開始して、クラウド同期済みの状態にする。
+ */
+async function completeAuthentication(userId: string): Promise<void> {
+  console.log("[Sync] 認証が確立しました userId=", userId);
+  useOutlineStore.setState({ userId, authChecked: true });
+  await flushPendingSync();
+  // PC⇄iPad間・複数タブ間などの他端末/他タブでの変更をリアルタイムに拾うため、
+  // folders/notes/nodesをまとめた単一チャンネルの購読を開始する
+  // (画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
+  subscribeSyncChannel(userId);
+  markSynced();
+}
+
+/**
+ * 既存のログインセッションを確認し、有効なら接続を確立する(手動再接続ボタン・
+ * オンライン復帰時に呼ぶ)。匿名認証は行わないため、セッション自体が無い場合は
+ * falseを返す(呼び出し側はログイン画面へ誘導する)。
  */
 async function connectSupabase(): Promise<boolean> {
   const client = getSupabaseClient();
@@ -2067,27 +2156,17 @@ async function connectSupabase(): Promise<boolean> {
     return false;
   }
 
-  console.log("[Sync] Supabaseへの接続確認(匿名認証)を開始します");
+  console.log("[Sync] Supabaseへの再接続を試みます(既存セッションの確認)");
   useOutlineStore.setState({ reconnecting: true });
   try {
-    const session = await ensureAnonymousSession();
+    const session = await getExistingSession();
     const userId = session?.user.id ?? null;
-    useOutlineStore.setState({ userId });
     if (!userId) {
-      console.log("[Sync] 匿名認証が完了しなかったため、クラウド同期済みにはできません");
-      useOutlineStore.setState({
-        syncStatus: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "error",
-      });
+      console.log("[Sync] 有効なセッションが無いため再接続できません。ログインが必要です");
+      useOutlineStore.setState({ userId: null });
       return false;
     }
-    console.log("[Sync] 匿名認証が完了しました。未送信分の同期キューを処理します userId=", userId);
-    await flushPendingSync();
-    // PC⇄iPad間・複数タブ間などの他端末/他タブでの変更をリアルタイムに拾うため、
-    // folders/notes/nodesをまとめた単一チャンネルの購読を開始する
-    // (画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
-    subscribeSyncChannel(userId);
-    console.log("[Sync] Supabaseとの接続・認証が確定しました。ステータスを更新します");
-    markSynced();
+    await completeAuthentication(userId);
     return true;
   } catch (err) {
     // IndexedDBの一時的な失敗等、予期しない例外が起きてもクラッシュさせず
@@ -2097,7 +2176,6 @@ async function connectSupabase(): Promise<boolean> {
       "[Sync] 接続処理で予期しないエラーが発生しました:",
       err instanceof Error ? err.message : err
     );
-    useOutlineStore.setState({ syncStatus: "error" });
     return false;
   } finally {
     useOutlineStore.setState({ reconnecting: false });

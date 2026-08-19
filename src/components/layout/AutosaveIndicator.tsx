@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Download, HardDrive, Loader2, RefreshCw, Upload } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Download, HardDrive, LogOut, Loader2, RefreshCw, Upload } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { Popover } from "@/components/ui/Popover";
@@ -24,7 +24,7 @@ function formatLastSynced(iso: string): string {
  *
  * 表示状態は、次のすべてが一致してはじめて「クラウド同期済み」を名乗る:
  *   1) Supabaseが設定されている(supabaseReady)
- *   2) 匿名認証セッションが確立している(userId が非null = isAnonymousなユーザーとして認証済み)
+ *   2) ログイン済みである(userId が非null)
  *   3) オンラインである(isOnline)
  *   4) 実際に書き込みが完了している(syncStatusが"saving"/"error"ではなく、
  *      ローカルの未送信キューが0件 = pendingCount === 0)
@@ -47,6 +47,7 @@ export function AutosaveIndicator() {
   const refreshPendingCount = useOutlineStore((s) => s.refreshPendingCount);
   const exportSnapshot = useOutlineStore((s) => s.exportSnapshot);
   const importSnapshot = useOutlineStore((s) => s.importSnapshot);
+  const signOut = useOutlineStore((s) => s.signOut);
 
   const [open, setOpen] = useState(false);
   const [importMessage, setImportMessage] = useState<string | null>(null);
@@ -63,7 +64,7 @@ export function AutosaveIndicator() {
   }, [refreshPendingCount]);
 
   const connected = supabaseReady && !!userId;
-  // Supabase自体は設定済みなのに、匿名認証がまだ通っていない(またはエラー状態)の場合に、
+  // Supabase自体は設定済みなのに、セッションがまだ確立していない(またはエラー状態)の場合に、
   // ワンタップで再接続できるボタンをモーダル内に出す
   const showReconnect = supabaseReady && !reconnecting && (syncStatus === "error" || !userId);
 
@@ -104,7 +105,7 @@ export function AutosaveIndicator() {
       return {
         icon: <Loader2 size={16} className="animate-spin" />,
         label: "Supabaseに接続中…",
-        detail: "匿名認証セッションを確立しています",
+        detail: "ログイン状態を確認しています",
         className: "text-sky-600 dark:text-sky-300",
       };
     }
@@ -145,6 +146,13 @@ export function AutosaveIndicator() {
     setReconnectMessage(null);
     const ok = await reconnectSupabase();
     setReconnectMessage(ok ? "Supabaseに接続しました" : "接続できませんでした。もう一度お試しください");
+  }
+
+  async function handleSignOut() {
+    const ok = window.confirm("ログアウトします。この端末のメモはそのまま残りますが、再度ログインするまでクラウド同期は止まります。よろしいですか?");
+    if (!ok) return;
+    setOpen(false);
+    await signOut();
   }
 
   function handleImportClick() {
@@ -248,6 +256,16 @@ export function AutosaveIndicator() {
             />
             {importMessage && <p className="text-xs text-ink-500">{importMessage}</p>}
           </div>
+
+          {supabaseReady && userId && (
+            <button
+              type="button"
+              onClick={() => void handleSignOut()}
+              className="flex items-center gap-2 rounded-md border border-ink-200 px-2.5 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-500/10"
+            >
+              <LogOut size={15} /> ログアウト
+            </button>
+          )}
         </div>
       </Popover>
     </div>
