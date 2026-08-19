@@ -28,7 +28,7 @@ import {
   midpointPosition,
   sequentialPositions,
 } from "@/lib/utils/tree";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { RealtimeChannel, RealtimePostgresChangesPayload, SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import { ensureAnonymousSession } from "@/lib/supabase/auth";
 import {
@@ -368,7 +368,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       client.auth.onAuthStateChange((event, session) => {
         console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
-          teardownGlobalRealtimeSubscriptions();
+          teardownSyncChannel();
           useOutlineStore.setState({ userId: null });
           void connectSupabase();
           return;
@@ -445,8 +445,6 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   },
 
   openNote: async (noteId) => {
-    unsubscribeRealtime?.();
-    unsubscribeRealtime = null;
     set({
       loading: true,
       currentNoteId: noteId,
@@ -492,11 +490,8 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       } else if (error) {
         devError("[sync] ノードの取得に失敗しました:", error.message);
       }
-      // 購読を貼る直前でも、その間に別のメモへ遷移していないか再確認する
-      // (遅いレスポンスが新しいメモの購読を横取りしないようにするため)
-      if (get().currentNoteId === noteId) {
-        unsubscribeRealtime = subscribeRealtime(noteId);
-      }
+      // nodesのRealtime購読はfolders/notesと同じ単一チャンネル(subscribeSyncChannel)が
+      // ユーザー全体を対象に常時張っているため、メモを開くたびに個別購読し直す必要はない
     }
 
     if (get().currentNoteId === noteId) {
@@ -544,13 +539,6 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       notesList: s.notesList.filter((n) => n.id !== noteId),
       ...(wasCurrent ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
     }));
-
-    // 削除したメモが今開いていたメモの場合のみ、そのリアルタイム購読を解除する
-    // (別のメモを削除しただけで、今開いているメモの購読を巻き込んで切らないようにする)
-    if (wasCurrent) {
-      unsubscribeRealtime?.();
-      unsubscribeRealtime = null;
-    }
 
     await persistDeleteNoteFull(noteId, nodeIds);
   },
@@ -1361,27 +1349,194 @@ function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
 // ストアのactionsから呼ばれるが、循環参照を避けるためストア定義の外側に置く。
 // ============================================================
 
-let unsubscribeRealtime: (() => void) | null = null;
-/** folders/notes一覧を対象にした常時リアルタイム購読の解除関数(認証済みの間ずっと有効) */
-let unsubscribeFoldersRealtime: (() => void) | null = null;
-let unsubscribeNotesRealtime: (() => void) | null = null;
+/**
+ * folders/notes/nodesの全変更を1本のRealtimeチャンネルにまとめて購読する
+ * (テーブルごとに別チャンネルを張らない)。userIdが確定している間ずっと有効で、
+ * 開いているメモに関わらず常時購読する。
+ */
+let syncChannel: RealtimeChannel | null = null;
+let syncChannelUserId: string | null = null;
+let syncChannelReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+/** 切断/エラー検知後、再購読を試みるまでの待機時間。タイトな再接続ループを避ける */
+const SYNC_CHANNEL_RECONNECT_DELAY_MS = 2000;
 
 /**
- * folders/notesの常時リアルタイム購読を(まだ無ければ)開始する。userIdが確定した
- * タイミング(起動時の匿名認証成功時・再接続時)で呼ぶ想定。既存の購読があれば
- * 二重に張らない。
+ * folders/notes/nodesの変更を1本のチャンネルで購読する。切断・タイムアウト・
+ * エラー(CHANNEL_ERROR/TIMED_OUT/CLOSED)を検知した場合は、一定時間後に
+ * 自動的に張り直す(userIdがまだ有効な間だけ)。
  */
-function ensureGlobalRealtimeSubscriptions(userId: string): void {
-  if (!unsubscribeFoldersRealtime) unsubscribeFoldersRealtime = subscribeFoldersRealtime(userId);
-  if (!unsubscribeNotesRealtime) unsubscribeNotesRealtime = subscribeNotesRealtime(userId);
+function subscribeSyncChannel(userId: string): void {
+  const client = getSupabaseClient();
+  if (!client) return;
+
+  teardownSyncChannel();
+  syncChannelUserId = userId;
+
+  console.log("[Sync] Realtimeチャンネルの購読を開始します userId=", userId);
+  syncChannel = client
+    .channel(`sync-${userId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "folders", filter: `user_id=eq.${userId}` },
+      handleFolderRealtimeChange
+    )
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "notes", filter: `user_id=eq.${userId}` },
+      handleNoteRealtimeChange
+    )
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "nodes", filter: `user_id=eq.${userId}` },
+      handleNodeRealtimeChange
+    )
+    .subscribe((status, err) => {
+      console.log("[Sync] Realtimeチャンネルの状態:", status, err?.message ?? "");
+      if (status === "SUBSCRIBED") {
+        if (syncChannelReconnectTimer) {
+          clearTimeout(syncChannelReconnectTimer);
+          syncChannelReconnectTimer = null;
+        }
+        return;
+      }
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        scheduleSyncChannelReconnect(userId);
+      }
+    });
 }
 
-/** サインアウト等でセッションが失われた際、folders/notesの常時購読も解除する */
-function teardownGlobalRealtimeSubscriptions(): void {
-  unsubscribeFoldersRealtime?.();
-  unsubscribeFoldersRealtime = null;
-  unsubscribeNotesRealtime?.();
-  unsubscribeNotesRealtime = null;
+/** 切断/エラーを検知した際、少し待ってから自動的に再購読する(多重予約はしない) */
+function scheduleSyncChannelReconnect(userId: string): void {
+  if (syncChannelReconnectTimer) return;
+  console.log("[Sync] Realtimeチャンネルが切断/エラーになりました。再接続を予約します");
+  syncChannelReconnectTimer = setTimeout(() => {
+    syncChannelReconnectTimer = null;
+    // 待機中にサインアウト/別ユーザーへの切替が起きていないか確認してから張り直す
+    if (useOutlineStore.getState().userId === userId) {
+      subscribeSyncChannel(userId);
+    }
+  }, SYNC_CHANNEL_RECONNECT_DELAY_MS);
+}
+
+/** サインアウト等でセッションが失われた際、Realtimeチャンネルを確実に解除する */
+function teardownSyncChannel(): void {
+  if (syncChannelReconnectTimer) {
+    clearTimeout(syncChannelReconnectTimer);
+    syncChannelReconnectTimer = null;
+  }
+  syncChannelUserId = null;
+  if (syncChannel) {
+    const client = getSupabaseClient();
+    if (client) void client.removeChannel(syncChannel);
+    syncChannel = null;
+  }
+}
+
+// ============================================================
+// BroadcastChannel: 同一ブラウザ内の複数タブ間を、Supabase Realtimeの往復
+// (ネットワークを挟むため数十〜数百ms)を待たずに即座(数ms)に同期する補強策。
+// 認証/オンライン状態に関わらず、ローカルへ書き込むたびに必ず送る
+// (オフライン中の編集も同一ブラウザの他タブへはこれで即時反映される)。
+// ============================================================
+const BROADCAST_CHANNEL_NAME = "outliner-sync-v1";
+
+type BroadcastMessage =
+  | { table: "folders"; op: "upsert"; row: FolderData }
+  | { table: "folders"; op: "delete"; id: string }
+  | { table: "notes"; op: "upsert"; row: NoteData }
+  | { table: "notes"; op: "delete"; id: string }
+  | { table: "nodes"; op: "upsert"; row: OutlineNodeData }
+  | { table: "nodes"; op: "delete"; id: string };
+
+let syncBroadcastChannel: BroadcastChannel | null = null;
+
+function getSyncBroadcastChannel(): BroadcastChannel | null {
+  if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return null;
+  if (!syncBroadcastChannel) {
+    syncBroadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+    syncBroadcastChannel.onmessage = (event) => {
+      try {
+        handleBroadcastMessage(event.data as BroadcastMessage);
+      } catch (err) {
+        devError(
+          "[sync] BroadcastChannelメッセージの処理に失敗しました:",
+          err instanceof Error ? err.message : err
+        );
+      }
+    };
+  }
+  return syncBroadcastChannel;
+}
+
+/** ローカルでの変更を、同一ブラウザの他タブへBroadcastChannel経由で即座に伝える */
+function postBroadcast(message: BroadcastMessage): void {
+  getSyncBroadcastChannel()?.postMessage(message);
+}
+
+/**
+ * 他タブからのBroadcastChannelメッセージを、Realtimeの受信ハンドラと同じ
+ * updatedAt比較でローカル(Zustand/IndexedDB)へ反映する。送信元のタブが既に
+ * Supabaseへの同期を担当しているため、ここではネットワークへの再送は一切行わない
+ * (BroadcastChannelは送信元自身には配送されない仕様のため、自己エコーの心配も無い)。
+ */
+function handleBroadcastMessage(message: BroadcastMessage): void {
+  if (message.table === "folders") {
+    if (message.op === "delete") {
+      useOutlineStore.setState((s) => ({ folders: s.folders.filter((f) => f.id !== message.id) }));
+      void dbDeleteFolderLocal(message.id);
+      return;
+    }
+    const incoming = message.row;
+    const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
+    if (existing && existing.updatedAt >= incoming.updatedAt) return;
+    useOutlineStore.setState((s) => ({
+      folders: sortFolders(
+        existing ? s.folders.map((f) => (f.id === incoming.id ? incoming : f)) : [...s.folders, incoming]
+      ),
+    }));
+    void dbPutFolder(incoming);
+    return;
+  }
+
+  if (message.table === "notes") {
+    if (message.op === "delete") {
+      useOutlineStore.setState((s) => ({
+        notesList: s.notesList.filter((n) => n.id !== message.id),
+        ...(s.currentNoteId === message.id ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
+      }));
+      void dbDeleteNoteLocal(message.id);
+      return;
+    }
+    const incoming = message.row;
+    const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
+    if (existing && existing.updatedAt >= incoming.updatedAt) return;
+    useOutlineStore.setState((s) => ({
+      notesList: sortNotes(
+        existing ? s.notesList.map((n) => (n.id === incoming.id ? incoming : n)) : [...s.notesList, incoming]
+      ),
+    }));
+    void dbPutNote(incoming);
+    return;
+  }
+
+  // table === "nodes"
+  if (message.op === "delete") {
+    void dbDeleteNode(message.id);
+    useOutlineStore.setState((s) => {
+      if (!(message.id in s.nodes)) return s;
+      const next = { ...s.nodes };
+      delete next[message.id];
+      return { nodes: next };
+    });
+    return;
+  }
+  const incoming = message.row;
+  void dbPutNode(incoming);
+  const state = useOutlineStore.getState();
+  if (state.currentNoteId !== incoming.noteId) return;
+  const existing = state.nodes[incoming.id];
+  if (existing && existing.updatedAt >= incoming.updatedAt) return;
+  useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
 }
 
 // ============================================================
@@ -1927,9 +2082,10 @@ async function connectSupabase(): Promise<boolean> {
     }
     console.log("[Sync] 匿名認証が完了しました。未送信分の同期キューを処理します userId=", userId);
     await flushPendingSync();
-    // PC⇄iPad間などの他端末での変更をリアルタイムに拾うため、folders/notesの
-    // 常時購読を開始する(画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
-    ensureGlobalRealtimeSubscriptions(userId);
+    // PC⇄iPad間・複数タブ間などの他端末/他タブでの変更をリアルタイムに拾うため、
+    // folders/notes/nodesをまとめた単一チャンネルの購読を開始する
+    // (画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
+    subscribeSyncChannel(userId);
     console.log("[Sync] Supabaseとの接続・認証が確定しました。ステータスを更新します");
     markSynced();
     return true;
@@ -2000,6 +2156,8 @@ function touchNoteTimestamp(noteId: string): void {
 async function persistNode(node: OutlineNodeData): Promise<void> {
   touchNoteTimestamp(node.noteId);
   await dbPutNode(node);
+  // Supabase Realtimeの往復を待たず、同一ブラウザの他タブへは即座に伝える
+  postBroadcast({ table: "nodes", op: "upsert", row: node });
 
   const client = getSupabaseClient();
   if (!client) {
@@ -2025,6 +2183,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
   if (ids.length === 0) return;
   if (noteId) touchNoteTimestamp(noteId);
   await dbDeleteNodes(ids);
+  ids.forEach((id) => postBroadcast({ table: "nodes", op: "delete", id }));
 
   const client = getSupabaseClient();
   if (!client) {
@@ -2051,6 +2210,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
 
 async function persistNote(note: NoteData): Promise<void> {
   await dbPutNote(note);
+  postBroadcast({ table: "notes", op: "upsert", row: note });
 
   const client = getSupabaseClient();
   if (!client) {
@@ -2072,6 +2232,8 @@ async function persistNote(note: NoteData): Promise<void> {
 async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise<void> {
   await dbDeleteNodes(nodeIds);
   await dbDeleteNoteLocal(noteId);
+  nodeIds.forEach((id) => postBroadcast({ table: "nodes", op: "delete", id }));
+  postBroadcast({ table: "notes", op: "delete", id: noteId });
 
   const client = getSupabaseClient();
   if (!client) return;
@@ -2089,6 +2251,7 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
 
 async function persistFolder(folder: FolderData): Promise<void> {
   await dbPutFolder(folder);
+  postBroadcast({ table: "folders", op: "upsert", row: folder });
 
   const client = getSupabaseClient();
   if (!client) {
@@ -2113,6 +2276,7 @@ async function persistFolder(folder: FolderData): Promise<void> {
  */
 async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: string[]): Promise<void> {
   await Promise.all(allIdsToDeleteLocally.map((id) => dbDeleteFolderLocal(id)));
+  allIdsToDeleteLocally.forEach((id) => postBroadcast({ table: "folders", op: "delete", id }));
 
   const client = getSupabaseClient();
   if (!client) return;
@@ -2222,152 +2386,103 @@ export async function flushPendingSync(): Promise<void> {
   }
 }
 
-/** 開いているメモの他端末での変更をリアルタイムに反映する */
-function subscribeRealtime(noteId: string): () => void {
-  const client = getSupabaseClient();
-  if (!client) return () => {};
+/**
+ * nodesテーブルのRealtimeイベント(単一チャンネル内の1テーブル分)を処理する。
+ * ユーザー全体のnodesを対象にするため、開いていないメモの行も届くが、
+ * ローカルのstate.nodesを書き換えるのは現在開いているメモの分だけにする
+ * (IndexedDBへの保存自体は開いていないメモの分も行い、次に開いたときに
+ * 最新の内容がすぐ見えるようにする)。
+ */
+function handleNodeRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
+  if (payload.eventType === "DELETE") {
+    const oldId = (payload.old as { id: string }).id;
+    useOutlineStore.setState((s) => {
+      if (!(oldId in s.nodes)) return s;
+      const next = { ...s.nodes };
+      delete next[oldId];
+      return { nodes: next };
+    });
+    void dbDeleteNode(oldId);
+    return;
+  }
 
-  const channel = client
-    .channel(`nodes-${noteId}`)
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "nodes", filter: `note_id=eq.${noteId}` },
-      (payload) => {
-        const state = useOutlineStore.getState();
-        if (state.currentNoteId !== noteId) return;
+  const incoming = nodeFromRow(payload.new as unknown as NodeRow);
+  // リアルタイムで受信した内容も、DOMへinnerHTMLとして描画する前に必ず
+  // サニタイズを通す(RLSで自分のデータしか流れてこないとはいえ、念のための多層防御)
+  incoming.content = sanitizeHtml(incoming.content);
+  markKnownRemote("nodes", [incoming.id]);
+  void dbPutNode(incoming);
 
-        if (payload.eventType === "DELETE") {
-          const oldId = (payload.old as { id: string }).id;
-          useOutlineStore.setState((s) => {
-            if (!(oldId in s.nodes)) return s;
-            const next = { ...s.nodes };
-            delete next[oldId];
-            return { nodes: next };
-          });
-          void dbDeleteNode(oldId);
-          return;
-        }
-
-        const incoming = nodeFromRow(payload.new as NodeRow);
-        // リアルタイムで受信した内容も、DOMへinnerHTMLとして描画する前に必ず
-        // サニタイズを通す(RLSで自分のデータしか流れてこないとはいえ、念のための多層防御)
-        incoming.content = sanitizeHtml(incoming.content);
-        const existing = state.nodes[incoming.id];
-        // 自分の書き込みのエコーや古い変更で上書きしないようにする
-        if (existing && existing.updatedAt >= incoming.updatedAt) return;
-
-        markKnownRemote("nodes", [incoming.id]);
-        useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
-        void dbPutNode(incoming);
-      }
-    )
-    .subscribe();
-
-  return () => {
-    void client.removeChannel(channel);
-  };
+  const state = useOutlineStore.getState();
+  if (state.currentNoteId !== incoming.noteId) return;
+  const existing = state.nodes[incoming.id];
+  // 自分の書き込みのエコーや古い変更で上書きしないようにする
+  if (existing && existing.updatedAt >= incoming.updatedAt) return;
+  useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
 }
 
 /**
- * folders一覧全体を対象にしたリアルタイム購読(開いているメモに関わらず常時購読)。
- * 別端末(PC等)でフォルダの追加・名前変更・移動・削除が行われた瞬間、画面全体を
- * 再取得することなく、差分のあった1件だけをピンポイントでローカル(Zustand/
- * IndexedDB)へ反映する。自分自身の書き込みが返ってきたエコーはupdatedAt比較で
- * 検知してスキップする(nodesの購読と同じ仕組み)。
+ * foldersテーブルのRealtimeイベントを処理する。別端末(PC等)でフォルダの追加・
+ * 名前変更・移動・削除が行われた瞬間、画面全体を再取得することなく、差分の
+ * あった1件だけをピンポイントでローカル(Zustand/IndexedDB)へ反映する。
+ * 自分自身の書き込みが返ってきたエコーはupdatedAt比較で検知してスキップする。
  */
-function subscribeFoldersRealtime(userId: string): () => void {
-  const client = getSupabaseClient();
-  if (!client) return () => {};
+function handleFolderRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
+  if (payload.eventType === "DELETE") {
+    const oldId = (payload.old as { id: string }).id;
+    useOutlineStore.setState((s) => {
+      if (!s.folders.some((f) => f.id === oldId)) return s;
+      return { folders: s.folders.filter((f) => f.id !== oldId) };
+    });
+    void dbDeleteFolderLocal(oldId);
+    console.log("[Sync] 他端末でフォルダが削除されました:", oldId);
+    return;
+  }
 
-  const channel = client
-    .channel(`folders-${userId}`)
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "folders", filter: `user_id=eq.${userId}` },
-      (payload) => {
-        if (payload.eventType === "DELETE") {
-          const oldId = (payload.old as { id: string }).id;
-          useOutlineStore.setState((s) => {
-            if (!s.folders.some((f) => f.id === oldId)) return s;
-            return { folders: s.folders.filter((f) => f.id !== oldId) };
-          });
-          void dbDeleteFolderLocal(oldId);
-          console.log("[Sync] 他端末でフォルダが削除されました:", oldId);
-          return;
-        }
+  const incoming = folderFromRow(payload.new as unknown as FolderRowType);
+  const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
+  if (existing && existing.updatedAt >= incoming.updatedAt) return;
 
-        const incoming = folderFromRow(payload.new as FolderRowType);
-        const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
-        // 自分の書き込みのエコーや古い変更で上書きしないようにする
-        if (existing && existing.updatedAt >= incoming.updatedAt) return;
-
-        markKnownRemote("folders", [incoming.id]);
-        useOutlineStore.setState((s) => ({
-          folders: sortFolders(
-            existing ? s.folders.map((f) => (f.id === incoming.id ? incoming : f)) : [...s.folders, incoming]
-          ),
-        }));
-        void dbPutFolder(incoming);
-        console.log("[Sync] 他端末でのフォルダの変更を反映しました:", incoming.id);
-      }
-    )
-    .subscribe();
-
-  return () => {
-    void client.removeChannel(channel);
-  };
+  markKnownRemote("folders", [incoming.id]);
+  useOutlineStore.setState((s) => ({
+    folders: sortFolders(
+      existing ? s.folders.map((f) => (f.id === incoming.id ? incoming : f)) : [...s.folders, incoming]
+    ),
+  }));
+  void dbPutFolder(incoming);
+  console.log("[Sync] 他端末でのフォルダの変更を反映しました:", incoming.id);
 }
 
 /**
- * notes一覧全体を対象にしたリアルタイム購読(開いているメモに関わらず常時購読)。
- * 別端末での新規作成・タイトル変更・フォルダ移動・削除を、差分のあった1件だけ
- * ピンポイントでローカルへ反映する。今開いているメモ自体が他端末で削除された
- * 場合は、安全のためメモを閉じる。
+ * notesテーブルのRealtimeイベントを処理する。別端末での新規作成・タイトル変更・
+ * フォルダ移動・削除を、差分のあった1件だけピンポイントでローカルへ反映する。
+ * 今開いているメモ自体が他端末で削除された場合は、安全のためメモを閉じる。
  */
-function subscribeNotesRealtime(userId: string): () => void {
-  const client = getSupabaseClient();
-  if (!client) return () => {};
+function handleNoteRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
+  if (payload.eventType === "DELETE") {
+    const oldId = (payload.old as { id: string }).id;
+    useOutlineStore.setState((s) => {
+      if (!s.notesList.some((n) => n.id === oldId)) return s;
+      return {
+        notesList: s.notesList.filter((n) => n.id !== oldId),
+        ...(s.currentNoteId === oldId ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
+      };
+    });
+    void dbDeleteNoteLocal(oldId);
+    console.log("[Sync] 他端末でメモが削除されました:", oldId);
+    return;
+  }
 
-  const channel = client
-    .channel(`notes-${userId}`)
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "notes", filter: `user_id=eq.${userId}` },
-      (payload) => {
-        if (payload.eventType === "DELETE") {
-          const oldId = (payload.old as { id: string }).id;
-          useOutlineStore.setState((s) => {
-            if (!s.notesList.some((n) => n.id === oldId)) return s;
-            return {
-              notesList: s.notesList.filter((n) => n.id !== oldId),
-              ...(s.currentNoteId === oldId
-                ? { currentNoteId: null, nodes: {}, activeNodeId: null }
-                : {}),
-            };
-          });
-          void dbDeleteNoteLocal(oldId);
-          console.log("[Sync] 他端末でメモが削除されました:", oldId);
-          return;
-        }
+  const incoming = noteFromRow(payload.new as unknown as NoteRowType);
+  const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
+  if (existing && existing.updatedAt >= incoming.updatedAt) return;
 
-        const incoming = noteFromRow(payload.new as NoteRowType);
-        const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
-        // 自分の書き込みのエコーや古い変更で上書きしないようにする
-        if (existing && existing.updatedAt >= incoming.updatedAt) return;
-
-        markKnownRemote("notes", [incoming.id]);
-        useOutlineStore.setState((s) => ({
-          notesList: sortNotes(
-            existing ? s.notesList.map((n) => (n.id === incoming.id ? incoming : n)) : [...s.notesList, incoming]
-          ),
-        }));
-        void dbPutNote(incoming);
-        console.log("[Sync] 他端末でのメモの変更を反映しました:", incoming.id);
-      }
-    )
-    .subscribe();
-
-  return () => {
-    void client.removeChannel(channel);
-  };
+  markKnownRemote("notes", [incoming.id]);
+  useOutlineStore.setState((s) => ({
+    notesList: sortNotes(
+      existing ? s.notesList.map((n) => (n.id === incoming.id ? incoming : n)) : [...s.notesList, incoming]
+    ),
+  }));
+  void dbPutNote(incoming);
+  console.log("[Sync] 他端末でのメモの変更を反映しました:", incoming.id);
 }
