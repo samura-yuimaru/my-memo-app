@@ -50,7 +50,11 @@ create table if not exists public.nodes (
   position double precision not null default 0,
   content text not null default '',
   node_type text not null default 'normal'
-    check (node_type in ('normal', 'why', 'context', 'keyterm', 'memo', 'deeper')),
+    check (node_type in ('normal', 'why', 'context', 'keyterm', 'deeper', 'next', 'memo')),
+  -- 'keyterm'は過去バージョンのスマートブロック種別で現在のUIからは挿入されないが、
+  -- 既存データとの互換のため許容し続ける。'next'(今後の動き/活かし方)は現行UIで
+  -- 挿入できる5種のひとつで、この制約に含めないとSupabase接続時にだけ同期が
+  -- 永久に失敗する(ローカルには保存されるがクラウドには一切反映されない)不具合になる。
   collapsed boolean not null default false,
   font_size text not null default 'md'
     check (font_size in ('sm', 'md', 'lg', 'xl')),

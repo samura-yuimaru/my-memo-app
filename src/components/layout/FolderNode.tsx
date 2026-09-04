@@ -178,8 +178,24 @@ export function FolderNode({
             </button>
           )}
 
-          {/* フォルダの操作は右クリックのコンテキストメニューと、この「…」に集約する
-              (フォルダ名が見切れないよう、常時表示のアイコンは最小限にとどめる) */}
+          {/* 新規メモ/サブフォルダ作成・名前変更は右クリックのコンテキストメニューと
+              「…」に集約する(フォルダ名が見切れないよう、常時表示のアイコンは最小限に
+              とどめる)。削除だけは、メモの行(NoteRow)と同じ操作感になるよう、
+              「…」の奥に隠さずゴミ箱アイコンを直接置いている */}
+          <IconButton
+            label="このフォルダを削除"
+            size="sm"
+            data-no-drag="true"
+            onClick={() => void handleDelete()}
+            className={clsx(
+              highlighted && SELECTED_TEXT_CLASS,
+              actionIconClass(highlighted),
+              "hover:!bg-rose-100 hover:!text-rose-600 dark:hover:!bg-rose-500/10 dark:hover:!text-rose-400"
+            )}
+          >
+            <Trash2 size={14} />
+          </IconButton>
+
           <div className="relative shrink-0" data-no-drag="true">
             <IconButton
               label="フォルダの操作"

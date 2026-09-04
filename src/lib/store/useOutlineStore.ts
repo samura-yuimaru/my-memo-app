@@ -414,6 +414,13 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     }
     set({ authChecked: true });
 
+    // 前回セッションで未送信のまま残っている削除キューをtombstoneへ先読みしておく。
+    // これを飛ばして直接loadFolders/loadNotesListを呼ぶと、まだサーバーに送信できて
+    // いない削除対象がここでの再取得によって復活してしまう(削除の取りこぼしの
+    // 起動時バージョン)。
+    const pendingDeletesAtStartup = await dbGetPendingDeletes();
+    for (const pd of pendingDeletesAtStartup) markDeletedLocally(pd.table, [pd.recordId]);
+
     console.log("[Sync] フォルダ/メモ一覧の読み込みを開始します");
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
     console.log("[Sync] 未送信分の同期キューのフラッシュを開始します");
@@ -436,7 +443,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       devError("[sync] フォルダ一覧の取得に失敗しました:", error.message);
       return;
     }
-    const remoteFolders = (data ?? []).map(folderFromRow);
+    const remoteFolders = excludeTombstoned("folders", (data ?? []).map(folderFromRow));
     markKnownRemote(
       "folders",
       remoteFolders.map((f) => f.id)
@@ -462,7 +469,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       devError("[sync] メモ一覧の取得に失敗しました:", error.message);
       return;
     }
-    const remoteNotes = (data ?? []).map(noteFromRow);
+    const remoteNotes = excludeTombstoned("notes", (data ?? []).map(noteFromRow));
     markKnownRemote(
       "notes",
       remoteNotes.map((n) => n.id)
@@ -503,7 +510,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
         client.from("nodes").select("*").eq("note_id", noteId)
       );
       if (!error && data) {
-        const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
+        const remoteNodes = excludeTombstoned("nodes", (data as NodeRow[]).map(nodeFromRow));
         markKnownRemote(
           "nodes",
           remoteNodes.map((n) => n.id)
@@ -1550,11 +1557,15 @@ function postBroadcast(message: BroadcastMessage): void {
 function handleBroadcastMessage(message: BroadcastMessage): void {
   if (message.table === "folders") {
     if (message.op === "delete") {
+      // 他タブでの削除も、このタブが同時に行っているかもしれないリモート再取得が
+      // 復活させてしまわないようtombstoneへ記録する
+      markDeletedLocally("folders", [message.id]);
       useOutlineStore.setState((s) => ({ folders: s.folders.filter((f) => f.id !== message.id) }));
       void dbDeleteFolderLocal(message.id);
       return;
     }
     const incoming = message.row;
+    if (isTombstoned("folders", incoming.id)) return;
     const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
     if (existing && existing.updatedAt >= incoming.updatedAt) return;
     useOutlineStore.setState((s) => ({
@@ -1568,6 +1579,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
 
   if (message.table === "notes") {
     if (message.op === "delete") {
+      markDeletedLocally("notes", [message.id]);
       useOutlineStore.setState((s) => ({
         notesList: s.notesList.filter((n) => n.id !== message.id),
         ...(s.currentNoteId === message.id ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
@@ -1576,6 +1588,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
       return;
     }
     const incoming = message.row;
+    if (isTombstoned("notes", incoming.id)) return;
     const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
     if (existing && existing.updatedAt >= incoming.updatedAt) return;
     useOutlineStore.setState((s) => ({
@@ -1589,6 +1602,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
 
   // table === "nodes"
   if (message.op === "delete") {
+    markDeletedLocally("nodes", [message.id]);
     void dbDeleteNode(message.id);
     useOutlineStore.setState((s) => {
       if (!(message.id in s.nodes)) return s;
@@ -1599,6 +1613,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
     return;
   }
   const incoming = message.row;
+  if (isTombstoned("nodes", incoming.id)) return;
   void dbPutNode(incoming);
   const state = useOutlineStore.getState();
   if (state.currentNoteId !== incoming.noteId) return;
@@ -1726,6 +1741,63 @@ function markKnownRemote(table: SyncTable, ids: Iterable<string>): void {
 
 function isKnownRemote(table: SyncTable, id: string): boolean {
   return knownRemoteIds.get(table)?.has(id) ?? false;
+}
+
+// ============================================================
+// 削除の「取りこぼし」防止(tombstone)
+// ローカルで削除した直後、まだサーバー側の削除リクエストが完了していないうちに
+// リモートからの再取得(タブ復帰時のrefreshFromRemote、Realtime、他タブからの
+// BroadcastChannel等)が割り込むと、mergeByUpdatedAtは「ローカルに存在しない=
+// 削除された」ことを表現できず、削除したはずの行がまだサーバー上に残っているのを
+// 拾って復活させてしまう(バグ票の「削除した数秒後に再表示される」の直接原因)。
+// これを防ぐため、削除操作を開始した瞬間に(通信の完了を待たず同期的に)その行を
+// tombstoneへ記録し、リモート/他タブ由来のデータをローカルへ取り込むすべての経路で
+// 必ずここを通して除外する。一定時間経過したエントリは削除が確実に完了している
+// 前提で自動的に無効化する(遅延読み取り時にその場で捨てる簡易クリーンアップ)。
+// ============================================================
+const TOMBSTONE_TTL_MS = 5 * 60 * 1000; // 5分あれば通常の削除リクエストは確実に完了している
+const tombstones = new Map<SyncTable, Map<string, number>>();
+
+/** idの集合を「ローカルで削除済み」として記録する。削除操作の一番最初に、通信を待たず同期的に呼ぶこと */
+function markDeletedLocally(table: SyncTable, ids: Iterable<string>): void {
+  let set = tombstones.get(table);
+  if (!set) {
+    set = new Map();
+    tombstones.set(table, set);
+  }
+  const now = Date.now();
+  for (const id of ids) set.set(id, now);
+}
+
+/** サーバー側の削除が確認できた等、tombstoneを保持し続ける必要が無くなった際に個別解除する(必須ではないがマップの肥大化を防ぐ) */
+function clearTombstone(table: SyncTable, ids: Iterable<string>): void {
+  const set = tombstones.get(table);
+  if (!set) return;
+  for (const id of ids) set.delete(id);
+}
+
+function isTombstoned(table: SyncTable, id: string): boolean {
+  const set = tombstones.get(table);
+  if (!set) return false;
+  const at = set.get(id);
+  if (at === undefined) return false;
+  if (Date.now() - at > TOMBSTONE_TTL_MS) {
+    set.delete(id);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * リモート/他タブから取得した行のうち、ローカルで削除済み(tombstone)のものを除外する。
+ * folders/notes一覧の再取得、開いているメモのnodes再取得、Realtimeでの受信、
+ * BroadcastChannelでの受信など、外部由来のデータをローカルへ反映するすべての経路で
+ * 必ずこれを通し、削除が復活しないようにする。
+ */
+function excludeTombstoned<T extends { id: string }>(table: SyncTable, rows: T[]): T[] {
+  const set = tombstones.get(table);
+  if (!set || set.size === 0) return rows;
+  return rows.filter((r) => !isTombstoned(table, r.id));
 }
 
 /** 複数の新規行をまとめて1回のinsert([...])で送る(POSTリクエスト) */
@@ -1873,18 +1945,23 @@ async function syncRowsToTable(
  * Supabaseへの同期リクエストをテーブル単位でまとめて軽量化するバッチキュー。
  * persistNode/persistNote/persistFolderは呼ばれるたびに即座に通信するのではなく、
  * ここへ「そのidの最新の行データ」を積むだけにする。同じidに何度persistしても
- * キュー上では1件に上書きされ、編集が止まってからSYNC_DEBOUNCE_MS(3000ms)その
+ * キュー上では1件に上書きされ、編集が止まってからSYNC_DEBOUNCE_MS(1200ms)その
  * idへの追加編集が無ければ送信される(id単位のデバウンス)。発火時にはその時点で
  * テーブルに溜まっている他のidも巻き込んでまとめて送るため、複数レコードを
  * 編集した場合も機会があれば1回の送信にまとまる。タブ離脱時はflushAllPendingSyncが
  * このタイマーを待たずに即時フラッシュする。
  */
-/** 編集が完全に止まってからこの時間が経つまでは通信しない(操作停止から3秒後の
- *  自動バッチ同期)。タブを離れる/閉じる場合はこのタイマーを待たずflushAllPendingSyncで
- *  即時送信されるため、体感の遅延なく取りこぼしも防げる。 */
-const SYNC_DEBOUNCE_MS = 3000;
-/** タイムアウト等で送れなかった変更を、ユーザー操作が無くても自動的に拾い直す間隔 */
-const BACKGROUND_RETRY_INTERVAL_MS = 8000;
+/**
+ * 編集が完全に止まってからこの時間が経つまでは通信しない(操作停止後の自動バッチ同期)。
+ * タブを離れる/閉じる場合はこのタイマーを待たずflushAllPendingSyncで即時送信されるため、
+ * この値自体はタイピング中の連続キーストロークを1回のリクエストへまとめるための
+ * ものだが、値が大きすぎると「保存されたはずなのに数秒間反映が見えない」体感の
+ * 遅さにつながるため、タイピングの一区切り(1秒強)を検知できる程度まで短縮している。
+ */
+const SYNC_DEBOUNCE_MS = 1200;
+/** タイムアウト等で送れなかった変更を、ユーザー操作が無くても自動的に拾い直す間隔。
+ *  同期の取りこぼしが画面に長く残らないよう、以前より短い間隔で再試行する。 */
+const BACKGROUND_RETRY_INTERVAL_MS = 4000;
 const pendingSyncRows = new Map<SyncTable, Map<string, NodeRow | NoteRowType | FolderRowType>>();
 const syncFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -2009,7 +2086,7 @@ async function refreshCurrentNoteNodesFromRemote(noteId: string): Promise<void> 
     return;
   }
   if (!data) return;
-  const remoteNodes = (data as NodeRow[]).map(nodeFromRow);
+  const remoteNodes = excludeTombstoned("nodes", (data as NodeRow[]).map(nodeFromRow));
   markKnownRemote(
     "nodes",
     remoteNodes.map((n) => n.id)
@@ -2259,6 +2336,9 @@ async function persistNode(node: OutlineNodeData): Promise<void> {
 
 async function persistDeleteNodes(ids: string[], noteId?: string | null): Promise<void> {
   if (ids.length === 0) return;
+  // 通信の完了を待たず、まず同期的にtombstone登録する(この直後に割り込むリモート
+  // 再取得が、まだサーバー上に残っているこの行を復活させてしまうのを防ぐため)
+  markDeletedLocally("nodes", ids);
   if (noteId) touchNoteTimestamp(noteId);
   await dbDeleteNodes(ids);
   ids.forEach((id) => postBroadcast({ table: "nodes", op: "delete", id }));
@@ -2283,6 +2363,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
     useOutlineStore.setState({ syncStatus: "error" });
   } else {
     markSynced();
+    clearTombstone("nodes", ids);
   }
 }
 
@@ -2308,6 +2389,9 @@ async function persistNote(note: NoteData): Promise<void> {
 }
 
 async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise<void> {
+  // ノード削除と同様、通信を待たず同期的にtombstone登録してから実際の削除に入る
+  markDeletedLocally("notes", [noteId]);
+  markDeletedLocally("nodes", nodeIds);
   await dbDeleteNodes(nodeIds);
   await dbDeleteNoteLocal(noteId);
   nodeIds.forEach((id) => postBroadcast({ table: "nodes", op: "delete", id }));
@@ -2320,10 +2404,15 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
     await dbAddPendingDelete("notes", noteId);
     return;
   }
+  // nodesはnotes.id削除時のon delete cascadeでリモート側も自動的に消える(notesの
+  // 削除さえ成功すればnode一件ずつ個別に削除リクエストを送る必要はない)
   const { error } = await safeCall(() => client.from("notes").delete().eq("id", noteId));
   if (error) {
     devError("[sync] メモの削除に失敗しました:", error.message);
     await dbAddPendingDelete("notes", noteId);
+  } else {
+    clearTombstone("notes", [noteId]);
+    clearTombstone("nodes", nodeIds);
   }
 }
 
@@ -2353,6 +2442,8 @@ async function persistFolder(folder: FolderData): Promise<void> {
  * リモートはルートの1件だけ削除要求を送ればFKのon delete cascadeが配下も処理してくれる。
  */
 async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: string[]): Promise<void> {
+  // サブフォルダも含めた全idを、通信を待たず同期的にtombstone登録してから削除する
+  markDeletedLocally("folders", allIdsToDeleteLocally);
   await Promise.all(allIdsToDeleteLocally.map((id) => dbDeleteFolderLocal(id)));
   allIdsToDeleteLocally.forEach((id) => postBroadcast({ table: "folders", op: "delete", id }));
 
@@ -2363,10 +2454,13 @@ async function persistDeleteFolderFull(folderId: string, allIdsToDeleteLocally: 
     await dbAddPendingDelete("folders", folderId);
     return;
   }
+  // フォルダ本体を削除すればon delete cascadeでサブフォルダもリモート側で自動的に消える
   const { error } = await safeCall(() => client.from("folders").delete().eq("id", folderId));
   if (error) {
     devError("[sync] フォルダの削除に失敗しました:", error.message);
     await dbAddPendingDelete("folders", folderId);
+  } else {
+    clearTombstone("folders", allIdsToDeleteLocally);
   }
 }
 
@@ -2474,6 +2568,7 @@ export async function flushPendingSync(): Promise<void> {
 function handleNodeRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
   if (payload.eventType === "DELETE") {
     const oldId = (payload.old as { id: string }).id;
+    markDeletedLocally("nodes", [oldId]);
     useOutlineStore.setState((s) => {
       if (!(oldId in s.nodes)) return s;
       const next = { ...s.nodes };
@@ -2485,6 +2580,9 @@ function handleNodeRealtimeChange(payload: RealtimePostgresChangesPayload<Record
   }
 
   const incoming = nodeFromRow(payload.new as unknown as NodeRow);
+  // ローカルで削除済み(tombstone)のidは、削除がまだサーバーに完全に伝播しきる前の
+  // 古いUPDATEイベント等で復活させないよう無視する
+  if (isTombstoned("nodes", incoming.id)) return;
   // リアルタイムで受信した内容も、DOMへinnerHTMLとして描画する前に必ず
   // サニタイズを通す(RLSで自分のデータしか流れてこないとはいえ、念のための多層防御)
   incoming.content = sanitizeHtml(incoming.content);
@@ -2508,6 +2606,7 @@ function handleNodeRealtimeChange(payload: RealtimePostgresChangesPayload<Record
 function handleFolderRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
   if (payload.eventType === "DELETE") {
     const oldId = (payload.old as { id: string }).id;
+    markDeletedLocally("folders", [oldId]);
     useOutlineStore.setState((s) => {
       if (!s.folders.some((f) => f.id === oldId)) return s;
       return { folders: s.folders.filter((f) => f.id !== oldId) };
@@ -2518,6 +2617,7 @@ function handleFolderRealtimeChange(payload: RealtimePostgresChangesPayload<Reco
   }
 
   const incoming = folderFromRow(payload.new as unknown as FolderRowType);
+  if (isTombstoned("folders", incoming.id)) return;
   const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
   if (existing && existing.updatedAt >= incoming.updatedAt) return;
 
@@ -2539,6 +2639,7 @@ function handleFolderRealtimeChange(payload: RealtimePostgresChangesPayload<Reco
 function handleNoteRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
   if (payload.eventType === "DELETE") {
     const oldId = (payload.old as { id: string }).id;
+    markDeletedLocally("notes", [oldId]);
     useOutlineStore.setState((s) => {
       if (!s.notesList.some((n) => n.id === oldId)) return s;
       return {
@@ -2552,6 +2653,7 @@ function handleNoteRealtimeChange(payload: RealtimePostgresChangesPayload<Record
   }
 
   const incoming = noteFromRow(payload.new as unknown as NoteRowType);
+  if (isTombstoned("notes", incoming.id)) return;
   const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
   if (existing && existing.updatedAt >= incoming.updatedAt) return;
 

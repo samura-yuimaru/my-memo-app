@@ -119,9 +119,16 @@ export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function
     if (node.content === lastKnownContentRef.current && !forced) return;
     lastKnownContentRef.current = node.content;
     if (isFocusedRef.current && !forced) return;
+    // Undo/Redoでフォーカス中のノードの内容を巻き戻す直前に、今いた文字位置を
+    // 覚えておく。常に末尾へ飛ばすと、長い行の途中を編集していた際にカーソルが
+    // 体感的に「変な位置」へワープしたように感じられるため、可能な限り同じ
+    // 文字位置(新しい内容がそれより短ければ末尾)へ戻す。
+    const preservedOffset = forced && isFocusedRef.current ? getSelectionOffsets(el)?.start : undefined;
     el.innerHTML = sanitizeHtml(node.content);
     if (forced && isFocusedRef.current) {
-      setCaretOffset(el, htmlToPlainText(el.innerHTML).length);
+      const plainLength = htmlToPlainText(el.innerHTML).length;
+      const target = preservedOffset !== undefined ? Math.min(preservedOffset, plainLength) : plainLength;
+      setCaretOffset(el, target);
     }
   }, [node.content, historyVersion]);
 
