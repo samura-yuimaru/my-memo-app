@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Clipboard, Copy, Scissors } from "lucide-react";
 import { OUTLINER_CLIPBOARD_MIME, useOutlineStore } from "@/lib/store/useOutlineStore";
 import {
   buildPlainTextOutline,
@@ -10,19 +9,16 @@ import {
   isSelfOrDescendant,
   midpointPosition,
 } from "@/lib/utils/tree";
-import { htmlToPlainText } from "@/lib/utils/richText";
 import { OutlineNode } from "./OutlineNode";
 import { DndContext, type DragOverState } from "./DndContext";
 
 /**
- * OSクリップボードへも書き込む(他アプリへの貼り付け・実際のCtrl+Vでの階層保持貼り付け用)。
- * 旧来のdocument.execCommand("copy")によるダミー要素選択トリックは、document自体が
- * フォーカスされていない状況(ボタンクリックの実装によってはこれが起こりうる)や、
+ * OSクリップボードへ書き込む(Ctrl+Cでの複数ノードコピー、他アプリへの貼り付け・
+ * 実際のCtrl+Vでの階層保持貼り付け用)。旧来のdocument.execCommand("copy")による
+ * ダミー要素選択トリックは、document自体がフォーカスされていない状況や、
  * ブラウザによる制限強化で確実に動くとは言えなくなっているため、非同期Clipboard API
- * (navigator.clipboard.write / writeText)を優先して使う。カスタムMIMEタイプ付きの
- * 書き込みに失敗した場合はプレーンテキストのみへ、それも失敗した場合は静かに諦める
- * (アプリ内でのコピー&ペースト自体はinternalClipboardPayloadで別途保証されるため、
- * OSクリップボードへの書き込み失敗はアプリの基本機能を損なわない)。
+ * (navigator.clipboard.write / writeText)を使う。カスタムMIMEタイプ付きの書き込みに
+ * 失敗した場合はプレーンテキストのみへ、それも失敗した場合は静かに諦める。
  */
 async function writeToOsClipboard(plainText: string, treePayload: string): Promise<void> {
   if (typeof navigator === "undefined" || !navigator.clipboard) return;
@@ -66,20 +62,9 @@ export function Outliner() {
   const outdentNodes = useOutlineStore((s) => s.outdentNodes);
   const buildClipboardPayload = useOutlineStore((s) => s.buildClipboardPayload);
   const pasteClipboardPayload = useOutlineStore((s) => s.pasteClipboardPayload);
-  const pasteLines = useOutlineStore((s) => s.pasteLines);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const tree = useMemo(() => buildTree(Object.values(nodes)), [nodes]);
-
-  // 「コピー」「カット」ボタンから直近でコピー/カットしたツリー構造付きの内容を
-  // 保持する。selectedNodeIds(範囲選択のハイライト)とは独立させているのがポイント:
-  // 選択ハイライトはクリックひとつで解除される(貼り付け先を選ぶために別のノードを
-  // クリックした瞬間など)のが自然な挙動だが、それによって「コピーした内容」まで
-  // 失われてしまうと、選択→コピー→貼り付け先をクリック→ペースト、という
-  // ごく普通の操作手順そのものが成立しなくなってしまう。特にタッチ操作環境では
-  // Ctrl+Vが使えずこの「ペースト」ボタンだけが頼りのため、reactな状態として保持し、
-  // 選択が解除された後もボタンを出し続けられるようにしている。
-  const [clipboardPayload, setClipboardPayload] = useState<string | null>(null);
 
   // メモ全体を選択している間(Notion風の2段階Ctrl+A、またはマウスドラッグでの範囲選択)は、
   // コピーをブラウザ標準のテキスト選択ではなく、階層をインデントで表したプレーンテキストとして書き出す。
@@ -90,11 +75,8 @@ export function Outliner() {
     (e: React.ClipboardEvent) => {
       if (selectedNodeIds.length === 0) return;
       e.preventDefault();
-      const payload = buildClipboardPayload(selectedNodeIds);
       e.clipboardData.setData("text/plain", buildPlainTextOutline(tree));
-      e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, payload);
-      // ボタンからの「ペースト」がCtrl+C由来のコピーにも追従できるよう、こちらでも記録する
-      setClipboardPayload(payload);
+      e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, buildClipboardPayload(selectedNodeIds));
     },
     [selectedNodeIds, tree, buildClipboardPayload]
   );
@@ -104,17 +86,17 @@ export function Outliner() {
     (e: React.ClipboardEvent) => {
       if (selectedNodeIds.length === 0) return;
       e.preventDefault();
-      const payload = buildClipboardPayload(selectedNodeIds);
       e.clipboardData.setData("text/plain", buildPlainTextOutline(tree));
-      e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, payload);
-      setClipboardPayload(payload);
+      e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, buildClipboardPayload(selectedNodeIds));
       deleteNodesBulk(selectedNodeIds);
     },
     [selectedNodeIds, tree, buildClipboardPayload, deleteNodesBulk]
   );
 
   // アプリ内貼り付け: カスタムMIMEが載っていれば、通常のペースト処理(1行のプレーンテキスト
-  // 展開)より先に(capture段階で)横取りして、ツリー構造を保ったまま現在のノードの直後へ挿入する
+  // 展開)より先に(capture段階で)横取りして、ツリー構造を保ったまま現在のノードの直後へ挿入する。
+  // e.clipboardDataという「実際のOSクリップボードの中身」だけを見る(古いコピー内容を
+  // 誤って貼り付けてしまわないよう、アプリ内部の記憶には一切頼らない)。
   const handlePasteCapture = useCallback(
     (e: React.ClipboardEvent) => {
       const payload = e.clipboardData?.getData(OUTLINER_CLIPBOARD_MIME);
@@ -128,61 +110,20 @@ export function Outliner() {
     [activeNodeId, pasteClipboardPayload]
   );
 
-  // 選択中ノードのコピー/カットをボタン(およびCtrl/Cmd+C・X)から実行する。
-  // clipboardPayload(state)へ即座に保持するため、この直後に「ペースト」ボタンを
-  // 押す一連の操作は、OSクリップボードの対応状況に関わらず必ず成功する。
-  // 加えてOSクリップボードへも書き込みを試み、他アプリへの貼り付け・実際のCtrl+Vでの
-  // 階層保持貼り付けにも対応する(失敗しても上記の理由でアプリ内の動作には影響しない)。
-  const handleCopyButton = useCallback(() => {
+  // 複数選択中のCtrl/Cmd+C・Xから呼ばれる。ノード単位の複数選択はネイティブのテキスト
+  // 選択を伴わないことが多く、そのままではブラウザのcopy/cutイベント自体が発火しない
+  // ことがあるため、ここで検知してOSクリップボードへ直接書き込む(専用のボタンUIは持たず、
+  // キーボード操作だけで完結する)。
+  const handleCopyShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    const plainText = buildPlainTextOutline(tree);
-    const payload = buildClipboardPayload(selectedNodeIds);
-    setClipboardPayload(payload);
-    void writeToOsClipboard(plainText, payload);
+    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds));
   }, [selectedNodeIds, tree, buildClipboardPayload]);
 
-  const handleCutButton = useCallback(() => {
+  const handleCutShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    const plainText = buildPlainTextOutline(tree);
-    const payload = buildClipboardPayload(selectedNodeIds);
-    setClipboardPayload(payload);
-    void writeToOsClipboard(plainText, payload);
+    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds));
     deleteNodesBulk(selectedNodeIds);
   }, [selectedNodeIds, tree, buildClipboardPayload, deleteNodesBulk]);
-
-  // ボタンからの貼り付け: まずclipboardPayload(直前にこのアプリ内でコピー/カットした
-  // 内容)を優先して使う(最も確実)。無ければOSクリップボードからカスタム形式を探し、
-  // それも無ければプレーンテキストを複数ノードとして展開する(他アプリでコピーした
-  // テキストを「ペースト」ボタンから貼り付けたい場合のため)。
-  const handlePasteButton = useCallback(async () => {
-    if (!activeNodeId) return;
-    if (clipboardPayload && pasteClipboardPayload(clipboardPayload, activeNodeId)) {
-      return;
-    }
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    try {
-      if (navigator.clipboard.read) {
-        const items = await navigator.clipboard.read();
-        for (const item of items) {
-          if (!item.types.includes(OUTLINER_CLIPBOARD_MIME)) continue;
-          const blob = await item.getType(OUTLINER_CLIPBOARD_MIME);
-          const text = await blob.text();
-          if (pasteClipboardPayload(text, activeNodeId)) return;
-        }
-      }
-      const text = await navigator.clipboard.readText?.();
-      if (text) {
-        // アプリ独自形式が無いプレーンテキストは、対象ノードの既存内容の末尾に
-        // 続ける形で複数の兄弟ノードとして展開する(先頭を上書きしてしまわないように)
-        const activeNode = useOutlineStore.getState().nodes[activeNodeId];
-        const endOffset = activeNode ? htmlToPlainText(activeNode.content).length : 0;
-        pasteLines(activeNodeId, endOffset, text.split(/\r\n|\r|\n/));
-      }
-    } catch {
-      // クリップボード読み取りの権限が無い/対応していないブラウザでは静かに諦める
-      // (Ctrl+Vやコピー直後のonPasteCaptureが正規の経路として引き続き使える)
-    }
-  }, [activeNodeId, clipboardPayload, pasteClipboardPayload, pasteLines]);
 
   // ------------------------------------------------------------
   // 行の並べ替え・スマート構造化ブロックへの出し入れ(ポインターイベント)
@@ -335,20 +276,17 @@ export function Outliner() {
         return;
       }
       const isMod = e.metaKey || e.ctrlKey;
-      // ノード単位の複数選択はネイティブのテキスト選択を伴わないことが多く、
-      // そのままではCtrl/Cmd+C・Xを押してもcopy/cutイベントが発火しないブラウザがあるため、
-      // ここで検知して合成copyイベントを発火させ、確実にhandleCopy/handleCutへ橋渡しする
       if (isMod && e.key.toLowerCase() === "c") {
         e.preventDefault();
-        handleCopyButton();
+        handleCopyShortcut();
         return;
       }
       if (isMod && e.key.toLowerCase() === "x") {
         e.preventDefault();
-        handleCutButton();
+        handleCutShortcut();
       }
     },
-    [selectedNodeIds, deleteNodesBulk, indentNodes, outdentNodes, handleCopyButton, handleCutButton]
+    [selectedNodeIds, deleteNodesBulk, indentNodes, outdentNodes, handleCopyShortcut, handleCutShortcut]
   );
 
   // ------------------------------------------------------------
@@ -383,44 +321,6 @@ export function Outliner() {
 
   return (
     <DndContext.Provider value={{ dragOver, startDrag }}>
-      {(selectedNodeIds.length > 0 || clipboardPayload) && (
-        <div className="sticky top-0 z-10 mb-2 flex items-center justify-center gap-1 rounded-lg border border-ink-200 bg-surface-alt/95 px-2 py-1.5 shadow-sm backdrop-blur">
-          <span className="mr-1 text-xs font-medium text-ink-500">
-            {selectedNodeIds.length > 0 ? `${selectedNodeIds.length}件選択中` : "コピー済み"}
-          </span>
-          {selectedNodeIds.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={handleCopyButton}
-                className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-ink-600 hover:bg-ink-100"
-              >
-                <Copy size={13} /> コピー
-              </button>
-              <button
-                type="button"
-                onClick={handleCutButton}
-                className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-ink-600 hover:bg-ink-100"
-              >
-                <Scissors size={13} /> カット
-              </button>
-            </>
-          )}
-          {clipboardPayload && (
-            // 選択(網掛け)を解除して貼り付け先のノードをクリックした後でも、コピー済みの
-            // 内容は保持されたままなのでペーストできる(タッチ操作環境ではCtrl+Vが
-            // 使えないため、この導線が唯一のペースト手段になる)
-            <button
-              type="button"
-              disabled={!activeNodeId}
-              onClick={() => void handlePasteButton()}
-              className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-ink-600 hover:bg-ink-100 disabled:opacity-40"
-            >
-              <Clipboard size={13} /> ペースト
-            </button>
-          )}
-        </div>
-      )}
       <div
         ref={containerRef}
         className="flex flex-col pb-56"
