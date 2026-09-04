@@ -3,10 +3,11 @@
 import { useRef } from "react";
 import clsx from "clsx";
 import { Trash2 } from "lucide-react";
-import { useOutlineStore } from "@/lib/store/useOutlineStore";
-import { countDescendants } from "@/lib/utils/tree";
+import { OUTLINER_CLIPBOARD_MIME, useOutlineStore } from "@/lib/store/useOutlineStore";
+import { buildTree, countDescendants, flattenVisible } from "@/lib/utils/tree";
 import { htmlToPlainText } from "@/lib/utils/richText";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
+import { writeToOsClipboard } from "@/lib/utils/clipboard";
 import { useLongPress } from "@/lib/utils/useLongPress";
 import { IconButton } from "@/components/ui/IconButton";
 import { actionIconClass, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
@@ -19,6 +20,29 @@ import { useDnd } from "./DndContext";
 import type { OutlineTreeNode } from "@/types/outline";
 
 const INDENT_WIDTH = 22;
+
+/**
+ * タッチでの範囲選択(長押しで開始→以降はタップで延長)専用のコピー処理。
+ * タッチ操作にはCtrl+C相当のショートカットが無く、かつ複数選択中の
+ * コピー/カット/ペーストのUIポップアップは撤去済みのため、「選択が変わった瞬間に
+ * その内容をOSクリップボードへ書き込む」ことで、選択そのものがコピー操作を兼ねる
+ * ようにしている(ネイティブのテキスト選択+コピー吹き出しのような体験に近づける)。
+ * プレーンテキストは階層のインデントまでは再現しない簡易版(改行区切りのみ)にとどめ、
+ * アプリ内貼り付けで使う階層構造付きのペイロードはstoreのbuildClipboardPayloadで
+ * 正確に組み立てる(こちらは他アプリへ貼り付けた場合の可読性のための保険にすぎない)。
+ */
+function copyTouchSelectionToClipboard(nodeIds: string[]): void {
+  if (nodeIds.length === 0) return;
+  const state = useOutlineStore.getState();
+  const flat = flattenVisible(buildTree(Object.values(state.nodes)));
+  const idSet = new Set(nodeIds);
+  const plainText = flat
+    .filter((n) => idSet.has(n.id))
+    .map((n) => htmlToPlainText(n.content))
+    .join("\n");
+  const payload = state.buildClipboardPayload(nodeIds);
+  void writeToOsClipboard(plainText, payload, OUTLINER_CLIPBOARD_MIME);
+}
 
 interface OutlineNodeProps {
   node: OutlineTreeNode;
@@ -35,7 +59,10 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
   const deleteNode = useOutlineStore((s) => s.deleteNode);
   const setActiveNodeId = useOutlineStore((s) => s.setActiveNodeId);
   const activeNodeId = useOutlineStore((s) => s.activeNodeId);
-  const isMultiSelected = useOutlineStore((s) => s.selectedNodeIds.includes(node.id));
+  const selectedNodeIds = useOutlineStore((s) => s.selectedNodeIds);
+  const selectionAnchorId = useOutlineStore((s) => s.selectionAnchorId);
+  const selectRangeNodes = useOutlineStore((s) => s.selectRangeNodes);
+  const isMultiSelected = selectedNodeIds.includes(node.id);
 
   const { dragOver, startDrag } = useDnd();
   const editorRef = useRef<NodeEditorHandle>(null);
@@ -62,6 +89,13 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
   // 短いタップはそのまま普段どおりカーソル配置・テキスト編集として通り、長押しと
   // 判定された場合だけドラッグへ移行する(タップとドラッグが競合しない)。
   // ボタン・既存のドラッグハンドル上の押下だけは、それぞれ専用の操作があるため対象外にする。
+  //
+  // タッチでの複数選択: 「指を動かさずに長押しして離す」と、まだ何も選択されていない
+  // 場合に限りこのノードを起点として選択モードに入る(=長押しドラッグでは動いた時点で
+  // 通常のドラッグへ進むため、この分岐と競合しない)。既に選択モード中であれば、
+  // 通常のタップ(長押し不要)がそのまま「起点からこの行までの範囲選択」として扱われる
+  // (下のhandleRowPointerDownで割り込む)。選択が変わるたびにOSクリップボードへも
+  // 書き込むため、タッチではマウスのCtrl+Cに相当する専用操作を用意していない。
   const rowLongPress = useLongPress({
     onLongPress: ({ pointerId, target }) => {
       // 長押し判定までの間にネイティブのテキスト選択が始まっていた場合に備えて解除しておく
@@ -70,10 +104,25 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
       startDrag(node.id);
       setActiveNodeId(node.id);
     },
+    onLongPressRelease: () => {
+      if (selectedNodeIds.length > 0) return; // 選択モード中は下のタップ延長に任せる
+      selectRangeNodes(node.id, node.id);
+      copyTouchSelectionToClipboard([node.id]);
+    },
   });
   function handleRowPointerDown(e: React.PointerEvent) {
     const target = e.target as HTMLElement;
     if (target.closest('button, [data-drag-handle], a, input')) return;
+    // 既にタッチでの選択モード中なら、この行への通常のタップを「範囲選択の延長」として
+    // 消費する(マウス操作は対象外。マウスは既存のドラッグ範囲選択をそのまま使う)
+    if (e.pointerType !== "mouse" && selectedNodeIds.length > 0) {
+      e.preventDefault();
+      const anchor =
+        selectionAnchorId && selectedNodeIds.includes(selectionAnchorId) ? selectionAnchorId : node.id;
+      selectRangeNodes(anchor, node.id);
+      copyTouchSelectionToClipboard(useOutlineStore.getState().selectedNodeIds);
+      return;
+    }
     rowLongPress.onPointerDown(e);
   }
 

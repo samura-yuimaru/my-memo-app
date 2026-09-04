@@ -136,8 +136,11 @@ interface OutlineState {
 
   activeNodeId: string | null;
   focusRequest: FocusRequest | null;
-  /** Notion風「2段階Ctrl+A」でのメモ全体選択、およびマウスドラッグでの範囲選択の両方を表す(空配列=通常状態) */
+  /** Notion風「2段階Ctrl+A」でのメモ全体選択、およびマウスドラッグ/タッチでの範囲選択の両方を表す(空配列=通常状態) */
   selectedNodeIds: string[];
+  /** 範囲選択の起点ノード。タッチ操作で「長押しで開始→以降はタップで延長」する際、
+   *  延長の基準点として使う(空配列=通常状態のときはnull) */
+  selectionAnchorId: string | null;
 
   /** Undo/Redo履歴(開いているメモのnodesスナップショットのスタック) */
   undoStack: Record<string, OutlineNodeData>[];
@@ -308,6 +311,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   activeNodeId: null,
   focusRequest: null,
   selectedNodeIds: [],
+  selectionAnchorId: null,
 
   undoStack: [],
   redoStack: [],
@@ -1161,7 +1165,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
   selectAllNodes: () => {
     const flat = flattenVisible(buildTree(Object.values(get().nodes)));
-    set({ selectedNodeIds: flat.map((n) => n.id) });
+    set({ selectedNodeIds: flat.map((n) => n.id), selectionAnchorId: flat[0]?.id ?? null });
   },
   selectRangeNodes: (anchorId, overId) => {
     const flat = flattenVisible(buildTree(Object.values(get().nodes)));
@@ -1169,9 +1173,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const oi = flat.findIndex((n) => n.id === overId);
     if (ai === -1 || oi === -1) return;
     const [lo, hi] = ai <= oi ? [ai, oi] : [oi, ai];
-    set({ selectedNodeIds: flat.slice(lo, hi + 1).map((n) => n.id) });
+    set({ selectedNodeIds: flat.slice(lo, hi + 1).map((n) => n.id), selectionAnchorId: anchorId });
   },
-  clearNodeSelection: () => set({ selectedNodeIds: [] }),
+  clearNodeSelection: () => set({ selectedNodeIds: [], selectionAnchorId: null }),
 
   buildClipboardPayload: (nodeIds) => {
     const nodes = get().nodes;

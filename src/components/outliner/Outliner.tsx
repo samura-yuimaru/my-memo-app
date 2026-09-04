@@ -9,38 +9,9 @@ import {
   isSelfOrDescendant,
   midpointPosition,
 } from "@/lib/utils/tree";
+import { writeToOsClipboard } from "@/lib/utils/clipboard";
 import { OutlineNode } from "./OutlineNode";
 import { DndContext, type DragOverState } from "./DndContext";
-
-/**
- * OSクリップボードへ書き込む(Ctrl+Cでの複数ノードコピー、他アプリへの貼り付け・
- * 実際のCtrl+Vでの階層保持貼り付け用)。旧来のdocument.execCommand("copy")による
- * ダミー要素選択トリックは、document自体がフォーカスされていない状況や、
- * ブラウザによる制限強化で確実に動くとは言えなくなっているため、非同期Clipboard API
- * (navigator.clipboard.write / writeText)を使う。カスタムMIMEタイプ付きの書き込みに
- * 失敗した場合はプレーンテキストのみへ、それも失敗した場合は静かに諦める。
- */
-async function writeToOsClipboard(plainText: string, treePayload: string): Promise<void> {
-  if (typeof navigator === "undefined" || !navigator.clipboard) return;
-  try {
-    if (navigator.clipboard.write && typeof ClipboardItem !== "undefined") {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          "text/plain": new Blob([plainText], { type: "text/plain" }),
-          [OUTLINER_CLIPBOARD_MIME]: new Blob([treePayload], { type: OUTLINER_CLIPBOARD_MIME }),
-        }),
-      ]);
-      return;
-    }
-  } catch {
-    // カスタムMIME付きの書き込みが拒否される環境向けに、プレーンテキストのみで再試行する
-  }
-  try {
-    await navigator.clipboard.writeText?.(plainText);
-  } catch {
-    // OSクリップボードへの書き込みが一切できない環境。アプリ内貼り付けには影響しない
-  }
-}
 
 /**
  * アウトライン本体。ツリー構築、ポインターベースのドラッグ&ドロップ(並べ替え・
@@ -62,9 +33,22 @@ export function Outliner() {
   const outdentNodes = useOutlineStore((s) => s.outdentNodes);
   const buildClipboardPayload = useOutlineStore((s) => s.buildClipboardPayload);
   const pasteClipboardPayload = useOutlineStore((s) => s.pasteClipboardPayload);
+  const clearNodeSelection = useOutlineStore((s) => s.clearNodeSelection);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const tree = useMemo(() => buildTree(Object.values(nodes)), [nodes]);
+
+  // 行以外の余白部分(一覧の下の空きスペース等)をタップ/クリックすると選択を解除する。
+  // マウスの範囲選択は行から始まるため誤って巻き込まれることはなく、タッチ操作で
+  // 複数選択モードから抜けるための主要な手段になる(専用の「終了」ボタンは置かない)。
+  const handleContainerClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.target === e.currentTarget && selectedNodeIds.length > 0) {
+        clearNodeSelection();
+      }
+    },
+    [selectedNodeIds, clearNodeSelection]
+  );
 
   // メモ全体を選択している間(Notion風の2段階Ctrl+A、またはマウスドラッグでの範囲選択)は、
   // コピーをブラウザ標準のテキスト選択ではなく、階層をインデントで表したプレーンテキストとして書き出す。
@@ -116,12 +100,12 @@ export function Outliner() {
   // キーボード操作だけで完結する)。
   const handleCopyShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds));
+    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
   }, [selectedNodeIds, tree, buildClipboardPayload]);
 
   const handleCutShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds));
+    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
     deleteNodesBulk(selectedNodeIds);
   }, [selectedNodeIds, tree, buildClipboardPayload, deleteNodesBulk]);
 
@@ -324,6 +308,7 @@ export function Outliner() {
       <div
         ref={containerRef}
         className="flex flex-col pb-56"
+        onClick={handleContainerClick}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
