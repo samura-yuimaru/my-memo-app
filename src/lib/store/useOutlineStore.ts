@@ -390,7 +390,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       client.auth.onAuthStateChange((event, session) => {
         console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
-          teardownSyncChannel();
+          void teardownSyncChannel();
           useOutlineStore.setState({ userId: null });
           return;
         }
@@ -1339,7 +1339,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
   signOut: async () => {
     console.log("[Sync] ログアウトします");
-    teardownSyncChannel();
+    await teardownSyncChannel();
     await authSignOut();
     // 端末内のローカルデータ(IndexedDB)はそのまま残す。再ログインすればまた見える。
     set({ userId: null, syncStatus: "idle" });
@@ -1438,22 +1438,56 @@ let syncChannelUserId: string | null = null;
 let syncChannelReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 /** 切断/エラー検知後、再購読を試みるまでの待機時間。タイトな再接続ループを避ける */
 const SYNC_CHANNEL_RECONNECT_DELAY_MS = 2000;
+/**
+ * subscribeSyncChannelの呼び出しを直列化するための鎖。
+ * ログイン直後は「起動時の既存セッション確認(init内のgetExistingSession)」と
+ * 「onAuthStateChangeのSIGNED_IN/INITIAL_SESSION通知」がほぼ同時に発火し、両方から
+ * ほぼ同時にsubscribeSyncChannelが呼ばれることがある(開発モードのReact StrictMode
+ * によるinit()の二重実行が重なると、さらに何重にもなることもある)。
+ * teardown(removeChannel)の完了を待たずに次の購読が始まると、supabase-js側は
+ * 同じトピック名の(まだ購読解除しきれていない)チャンネルを再利用してしまい、
+ * そこへさらに.on()を呼ぶ形になって「cannot add postgres_changes callbacks ...
+ * after subscribe()」という未捕捉の例外が起きていた。この鎖で「必ず前回の破棄が
+ * 完了してから次の購読を始める」ことを保証する。
+ */
+let syncChannelOpChain: Promise<void> = Promise.resolve();
+/**
+ * チャンネルのトピック名に付ける連番。前のチャンネルがsupabase-js内部でまだ
+ * 完全に破棄しきれていない(unsubscribe()が'ok'を返すまでjoin中は待たされる等)
+ * 場合でも、トピック名を変えることで既存チャンネルの使い回しを避け、購読済みの
+ * インスタンスに.on()を呼んでしまう事態そのものを起こらなくする(直列化と併用する
+ * ことで二重の保険にしている)。
+ */
+let syncChannelSeq = 0;
 
 /**
  * folders/notes/nodesの変更を1本のチャンネルで購読する。切断・タイムアウト・
  * エラー(CHANNEL_ERROR/TIMED_OUT/CLOSED)を検知した場合は、一定時間後に
  * 自動的に張り直す(userIdがまだ有効な間だけ)。
+ * 呼び出し自体は同期的(fire-and-forget)だが、実際の張り替えはsyncChannelOpChainで
+ * 直列化されるため、短時間に複数回呼ばれても競合しない。
  */
 function subscribeSyncChannel(userId: string): void {
+  syncChannelOpChain = syncChannelOpChain
+    .catch(() => {
+      // 前回の張り替えが失敗していても鎖を継続させる(今回の呼び出しは行う)
+    })
+    .then(() => subscribeSyncChannelSequential(userId));
+}
+
+async function subscribeSyncChannelSequential(userId: string): Promise<void> {
   const client = getSupabaseClient();
   if (!client) return;
 
-  teardownSyncChannel();
+  await teardownSyncChannel();
+  // 直列待機している間にサインアウト/別ユーザーへの切替が起きていた場合は何もしない
+  if (useOutlineStore.getState().userId !== userId) return;
   syncChannelUserId = userId;
 
   console.log("[Sync] Realtimeチャンネルの購読を開始します userId=", userId);
+  syncChannelSeq += 1;
   syncChannel = client
-    .channel(`sync-${userId}`)
+    .channel(`sync-${userId}-${syncChannelSeq}`)
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "folders", filter: `user_id=eq.${userId}` },
@@ -1497,8 +1531,13 @@ function scheduleSyncChannelReconnect(userId: string): void {
   }, SYNC_CHANNEL_RECONNECT_DELAY_MS);
 }
 
-/** サインアウト等でセッションが失われた際、Realtimeチャンネルを確実に解除する */
-function teardownSyncChannel(): void {
+/**
+ * サインアウト等でセッションが失われた際、Realtimeチャンネルを確実に解除する。
+ * removeChannel()の完了を待ってから返す(呼び出し元のsubscribeSyncChannelSequentialが、
+ * 破棄が完了しきる前に同じトピック名で次のチャンネルを作ってしまわないようにするため)。
+ * サインアウト時など、完了を待たずに呼ぶだけの箇所ではPromiseを無視してよい。
+ */
+async function teardownSyncChannel(): Promise<void> {
   if (syncChannelReconnectTimer) {
     clearTimeout(syncChannelReconnectTimer);
     syncChannelReconnectTimer = null;
@@ -1506,8 +1545,16 @@ function teardownSyncChannel(): void {
   syncChannelUserId = null;
   if (syncChannel) {
     const client = getSupabaseClient();
-    if (client) void client.removeChannel(syncChannel);
+    const toRemove = syncChannel;
     syncChannel = null;
+    if (client) {
+      try {
+        await client.removeChannel(toRemove);
+      } catch {
+        // 破棄に失敗しても致命的ではない(次に張るチャンネルはトピック名が同じままなので
+        // 多少残っていても実害は小さい。ここで例外を投げて呼び出し元の直列鎖を止めない)
+      }
+    }
   }
 }
 
