@@ -10,6 +10,10 @@ export interface FolderRow {
   position: number;
   created_at: string;
   updated_at: string;
+  /** 論理削除日時(nullなら未削除)。select("*")で読み取る用で、書き込み(*ToRow)には含めない
+   *  ―通常の内容編集アップサートが遅れて届いても、この列を上書きして削除状態を
+   *  巻き戻してしまわないようにするため */
+  deleted_at?: string | null;
 }
 
 export interface NoteRow {
@@ -19,6 +23,7 @@ export interface NoteRow {
   folder_id: string | null;
   created_at: string;
   updated_at: string;
+  deleted_at?: string | null;
 }
 
 export interface NodeRow {
@@ -35,6 +40,7 @@ export interface NodeRow {
   highlight_color: string | null;
   created_at: string;
   updated_at: string;
+  deleted_at?: string | null;
 }
 
 export function folderFromRow(row: FolderRow): FolderData {

@@ -69,6 +69,24 @@ create index if not exists nodes_parent_id_idx on public.nodes (parent_id);
 create index if not exists nodes_user_id_idx on public.nodes (user_id);
 
 -- ------------------------------------------------------------
+-- deleted_at: 論理削除(ソフトデリート)用カラム
+-- ------------------------------------------------------------
+-- アプリは物理削除(DELETE)を使わず、常にこのカラムへ削除日時をUPDATEすることで
+-- 論理削除する。「削除された」という事実がサーバー側に永続的に残るため、
+-- クライアント側だけの一時的な記憶(tombstone)の有効期限や、削除直前の編集の
+-- 再送(アップサート)がたまたま遅れて届いた場合でも、削除状態が巻き戻って
+-- 画面に復活することがなくなる(アップサートはリクエストに含めた列しか更新しない
+-- ため、deleted_atを含めない通常の編集アップサートはこの列に触れない)。
+-- 一覧取得・差分取得はすべて deleted_at is null の行だけを対象にする。
+alter table public.folders add column if not exists deleted_at timestamptz;
+alter table public.notes add column if not exists deleted_at timestamptz;
+alter table public.nodes add column if not exists deleted_at timestamptz;
+
+create index if not exists folders_deleted_at_idx on public.folders (deleted_at);
+create index if not exists notes_deleted_at_idx on public.notes (deleted_at);
+create index if not exists nodes_deleted_at_idx on public.nodes (deleted_at);
+
+-- ------------------------------------------------------------
 -- updated_at 自動更新トリガー
 -- ------------------------------------------------------------
 create or replace function public.set_updated_at()
