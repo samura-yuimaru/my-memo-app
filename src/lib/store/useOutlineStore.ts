@@ -1999,19 +1999,41 @@ const SYNC_TABLE_DEPENDS_ON: Partial<Record<SyncTable, SyncTable>> = {
   nodes: "notes",
 };
 
+/**
+ * テーブルごとに「今まさに送信中(サーバーへのHTTPリクエストが完了していない)」
+ * flushTableQueue呼び出しのPromiseを憶えておく。新規メモ作成時のように、notesと
+ * その1行目のnodeがほぼ同時にキューへ積まれた場合、両方のデバウンスタイマーが
+ * ほぼ同時に発火して「notesのキューは既に空(=送信済み)」に見えても、実際には
+ * notesの書き込みがまだサーバーへ到達・コミットされていないことがある
+ * (「キューが空」は「送信を開始した」を意味するだけで「サーバー側で確定した」を
+ * 意味しない)。この空白期間に依存先テーブル(nodesならnotes)を待たずに送信すると、
+ * 外部キー制約違反(nodes_note_id_fkeyなど)でその回の送信が失敗する。
+ * このMapで実際の完了(レスポンス受信)まで待てるようにし、この競合を根本的に防ぐ。
+ */
+const inFlightTableFlush = new Map<SyncTable, Promise<void>>();
+
 /** キューに溜まった特定テーブルの全行を、insert/updateへ振り分けてまとめて送信する */
 async function flushTableQueue(table: SyncTable): Promise<void> {
-  // 親テーブル(folders→notes→nodes)の保留分が残っていれば、直列に先に完了させる
+  // 親テーブル(folders→notes→nodes)がまだキューに残っている、または送信中(HTTPの
+  // レスポンス待ち)であれば、外部キー制約違反を避けるため必ず先に完了させる
   const dependsOn = SYNC_TABLE_DEPENDS_ON[table];
-  if (dependsOn && (pendingSyncRows.get(dependsOn)?.size ?? 0) > 0) {
-    console.log(`[Sync] ${table}の送信前に、依存先の${dependsOn}を先に同期します`);
-    for (const timerKey of Array.from(syncFlushTimers.keys())) {
-      if (timerKey.startsWith(`${dependsOn}:`)) {
-        clearTimeout(syncFlushTimers.get(timerKey));
-        syncFlushTimers.delete(timerKey);
+  if (dependsOn) {
+    if ((pendingSyncRows.get(dependsOn)?.size ?? 0) > 0) {
+      console.log(`[Sync] ${table}の送信前に、依存先の${dependsOn}を先に同期します`);
+      for (const timerKey of Array.from(syncFlushTimers.keys())) {
+        if (timerKey.startsWith(`${dependsOn}:`)) {
+          clearTimeout(syncFlushTimers.get(timerKey));
+          syncFlushTimers.delete(timerKey);
+        }
+      }
+      await flushTableQueue(dependsOn);
+    } else {
+      const dependsInFlight = inFlightTableFlush.get(dependsOn);
+      if (dependsInFlight) {
+        console.log(`[Sync] ${table}の送信前に、送信中の${dependsOn}の完了を待ちます`);
+        await dependsInFlight;
       }
     }
-    await flushTableQueue(dependsOn);
   }
 
   const tableQueue = pendingSyncRows.get(table);
@@ -2029,22 +2051,31 @@ async function flushTableQueue(table: SyncTable): Promise<void> {
     return;
   }
 
-  console.log(`[Sync] ${table}をバッチ送信します (${rows.length}件, id=${ids.join(",")})`);
-  const failedIds = await syncRowsToTable(client, table, rows);
-  const succeededIds = ids.filter((id) => !failedIds.has(id));
-  if (succeededIds.length > 0) await Promise.all(succeededIds.map((id) => dbClearDirty(table, id)));
-  if (failedIds.size > 0) {
-    // タイムアウトや一時的な通信障害でも、画面を「同期エラー」や「同期中…」のまま
-    // 固まらせない。syncStatusを"idle"へ戻すことでAutosaveIndicatorの表示は
-    // pendingCount(このあとdirty化する分)を見た「同期中…(送信待ちN件)」表示へ
-    // フォールバックし、バックグラウンドの定期リトライ・オンライン復帰・タブ復帰時に
-    // 自動的に再送される(dirtyのまま残すのでデータが失われることは無い)。
-    console.log(`[Sync] ${table}のバッチ送信で失敗した行があります(バックグラウンドで再試行します):`, Array.from(failedIds).join(","));
-    await Promise.all(Array.from(failedIds).map((id) => dbMarkDirty(table, id)));
-    useOutlineStore.setState({ syncStatus: "idle" });
-    void refreshPendingCount();
-  } else {
-    markSynced();
+  const sendPromise = (async () => {
+    console.log(`[Sync] ${table}をバッチ送信します (${rows.length}件, id=${ids.join(",")})`);
+    const failedIds = await syncRowsToTable(client, table, rows);
+    const succeededIds = ids.filter((id) => !failedIds.has(id));
+    if (succeededIds.length > 0) await Promise.all(succeededIds.map((id) => dbClearDirty(table, id)));
+    if (failedIds.size > 0) {
+      // タイムアウトや一時的な通信障害でも、画面を「同期エラー」や「同期中…」のまま
+      // 固まらせない。syncStatusを"idle"へ戻すことでAutosaveIndicatorの表示は
+      // pendingCount(このあとdirty化する分)を見た「同期中…(送信待ちN件)」表示へ
+      // フォールバックし、バックグラウンドの定期リトライ・オンライン復帰・タブ復帰時に
+      // 自動的に再送される(dirtyのまま残すのでデータが失われることは無い)。
+      console.log(`[Sync] ${table}のバッチ送信で失敗した行があります(バックグラウンドで再試行します):`, Array.from(failedIds).join(","));
+      await Promise.all(Array.from(failedIds).map((id) => dbMarkDirty(table, id)));
+      useOutlineStore.setState({ syncStatus: "idle" });
+      void refreshPendingCount();
+    } else {
+      markSynced();
+    }
+  })();
+
+  inFlightTableFlush.set(table, sendPromise);
+  try {
+    await sendPromise;
+  } finally {
+    if (inFlightTableFlush.get(table) === sendPromise) inFlightTableFlush.delete(table);
   }
 }
 
