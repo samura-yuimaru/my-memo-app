@@ -76,6 +76,16 @@ import {
 const DEFAULT_NOTE_TITLE = "無題のメモ";
 
 /**
+ * 一度でも認証に成功したuserIdをlocalStorageへ覚えておくためのキー。
+ * iPad等でネットが無い状態でアプリを開いた場合、Supabaseへ既存セッションを
+ * 問い合わせる通信自体がタイムアウトし、これまでは「セッション確認できず」=
+ * ログイン画面行き、という扱いになっていた。前回ログインしていたユーザーが
+ * 分かっていれば、オンライン確認が取れなくてもそのユーザーとして手元の
+ * IndexedDBのデータだけで起動を続けられるようにするために使う。
+ */
+const LAST_KNOWN_USER_ID_KEY = "outliner-last-known-user-id";
+
+/**
  * アプリ内コピー&ペーストでツリー構造(親子関係)を保持するためのクリップボードMIMEタイプ。
  * 標準の"text/plain"と一緒にこの形式も書き込んでおき、アプリ内へ貼り付けるときだけ
  * こちらを優先して読み取る(他アプリへのペーストは従来どおりプレーンテキストになる)。
@@ -125,6 +135,10 @@ interface OutlineState {
   /** 起動時の既存セッション確認が完了したかどうか。falseの間はログイン画面を出さず待機する
    *  (ログイン済みなのに一瞬ログイン画面がちらつくのを防ぐ) */
   authChecked: boolean;
+  /** オフライン等でSupabaseへセッションを確認できず、前回ログインしていたユーザーとして
+   *  ローカルデータのみで起動を続けている状態かどうか。trueの間はRealtime購読・
+   *  リモートからの読み込みを試みない(オンライン復帰時にconnectSupabaseが正式に完了させる) */
+  offlineBoot: boolean;
   /** ログイン/新規登録フォームの送信中かどうか(ボタンの多重押下防止) */
   authenticating: boolean;
 
@@ -300,6 +314,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
   reconnecting: false,
   pendingCount: 0,
   authChecked: false,
+  offlineBoot: false,
   authenticating: false,
 
   folders: [],
@@ -335,9 +350,11 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       window.addEventListener("online", () => {
         console.log("[Sync] オンラインに復帰しました");
         useOutlineStore.setState({ isOnline: true });
-        // オンライン復帰時: まだ接続できていなければ既存セッションの確認からやり直し、
-        // 既に認証済みならそのまま未送信分をまとめて送る
-        if (!useOutlineStore.getState().userId) void connectSupabase();
+        // オンライン復帰時: まだ接続できていない、またはオフラインフォールバックで
+        // 起動しただけ(Realtime購読・リモート読み込みが未完了)であれば既存セッションの
+        // 確認からやり直し、完全に認証済みならそのまま未送信分をまとめて送る
+        const s = useOutlineStore.getState();
+        if (!s.userId || s.offlineBoot) void connectSupabase();
         else void flushPendingSync();
       });
       window.addEventListener("offline", () => {
@@ -407,11 +424,16 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     // 起動時: 既に有効なセッション(=ログイン済み)があるかだけを確認する。
     // 無ければ新規にサインインさせたりはしない(PC/iPad間で同じアカウントを共有する
     // ため、匿名認証は廃止しており、ログイン画面から明示的にログインしてもらう)。
+    // オンライン確認ができなかった場合(iPadでネットが無い状態で開いた等)でも、
+    // 一度でもログインしたことがあれば、resolveSessionOrOfflineFallbackが
+    // 前回のuserIdへフォールバックしてローカルデータのみでの起動を続けさせる。
     if (client) {
       console.log("[Sync] 既存セッションの確認を開始します");
-      const session = await getExistingSession();
-      if (session) {
-        await completeAuthentication(session.user.id);
+      const { userId: resolvedUserId, offline } = await resolveSessionOrOfflineFallback();
+      if (resolvedUserId && !offline) {
+        await completeAuthentication(resolvedUserId);
+      } else if (resolvedUserId && offline) {
+        set({ userId: resolvedUserId, offlineBoot: true, syncStatus: "offline" });
       } else {
         console.log("[Sync] 有効なセッションが無いため、ログイン画面を表示します");
       }
@@ -438,7 +460,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
     const client = getSupabaseClient();
     const userId = get().userId;
-    if (!client || !userId) return;
+    // オフラインが分かっている間は通信を試みず、手元のデータのみで即座に終える
+    // (iPad等でネットが無い状態での起動を、タイムアウト待ちで遅くしないため)
+    if (!client || !userId || (typeof navigator !== "undefined" && !navigator.onLine)) return;
 
     const { data, error } = await safeCall(() =>
       client.from("folders").select("*").eq("user_id", userId)
@@ -470,7 +494,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
     const client = getSupabaseClient();
     const userId = get().userId;
-    if (!client || !userId) return;
+    if (!client || !userId || (typeof navigator !== "undefined" && !navigator.onLine)) return;
 
     const { data, error } = await safeCall(() =>
       client.from("notes").select("*").eq("user_id", userId)
@@ -518,7 +542,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
     const client = getSupabaseClient();
     const userId = get().userId;
-    if (client && userId) {
+    if (client && userId && (typeof navigator === "undefined" || navigator.onLine)) {
       const { data, error } = await safeCall(() =>
         client.from("nodes").select("*").eq("note_id", noteId)
       );
@@ -2348,7 +2372,10 @@ async function refreshPendingCount(): Promise<void> {
  */
 async function completeAuthentication(userId: string): Promise<void> {
   console.log("[Sync] 認証が確立しました userId=", userId);
-  useOutlineStore.setState({ userId, authChecked: true });
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(LAST_KNOWN_USER_ID_KEY, userId);
+  }
+  useOutlineStore.setState({ userId, authChecked: true, offlineBoot: false });
   await flushPendingSync();
   // PC⇄iPad間・複数タブ間などの他端末/他タブでの変更をリアルタイムに拾うため、
   // folders/notes/nodesをまとめた単一チャンネルの購読を開始する
@@ -2358,9 +2385,34 @@ async function completeAuthentication(userId: string): Promise<void> {
 }
 
 /**
+ * 既存セッションをSupabaseへ問い合わせ、確認できればそのuserIdを返す。
+ * オフライン等で問い合わせ自体ができなかった場合は、前回ログインに成功していた
+ * userId(LAST_KNOWN_USER_ID_KEY)があればそれを「オフラインフォールバック」として
+ * 返す ―iPadでネットが無い状態でアプリを開いた瞬間、いきなりログイン画面へ
+ * 戻されてしまうのを防ぐため。手元のIndexedDBのデータはSupabaseの特定ユーザーに
+ * 紐付けて分離しているわけではないため、このuserIdは主に「ログイン画面を出さない」
+ * 判定と、オンライン復帰時に正式な再接続をやり直すためのマーカーとして使う。
+ */
+async function resolveSessionOrOfflineFallback(): Promise<{ userId: string | null; offline: boolean }> {
+  const session = await getExistingSession();
+  if (session) return { userId: session.user.id, offline: false };
+
+  const lastKnownUserId =
+    typeof window !== "undefined" ? window.localStorage.getItem(LAST_KNOWN_USER_ID_KEY) : null;
+  if (lastKnownUserId) {
+    console.log(
+      "[Sync] オンラインでのセッション確認ができなかったため、前回ログインしていたユーザーとしてローカルデータのみで続行します"
+    );
+    return { userId: lastKnownUserId, offline: true };
+  }
+  return { userId: null, offline: false };
+}
+
+/**
  * 既存のログインセッションを確認し、有効なら接続を確立する(手動再接続ボタン・
- * オンライン復帰時に呼ぶ)。匿名認証は行わないため、セッション自体が無い場合は
- * falseを返す(呼び出し側はログイン画面へ誘導する)。
+ * オンライン復帰時に呼ぶ)。匿名認証は行わないため、セッション自体が無く、
+ * オフラインフォールバックの対象にもならない場合はfalseを返す
+ * (呼び出し側はログイン画面へ誘導する)。
  */
 async function connectSupabase(): Promise<boolean> {
   const client = getSupabaseClient();
@@ -2376,11 +2428,17 @@ async function connectSupabase(): Promise<boolean> {
   console.log("[Sync] Supabaseへの再接続を試みます(既存セッションの確認)");
   useOutlineStore.setState({ reconnecting: true });
   try {
-    const session = await getExistingSession();
-    const userId = session?.user.id ?? null;
+    const { userId, offline } = await resolveSessionOrOfflineFallback();
     if (!userId) {
       console.log("[Sync] 有効なセッションが無いため再接続できません。ログインが必要です");
       useOutlineStore.setState({ userId: null });
+      return false;
+    }
+    if (offline) {
+      // オンライン確認はできなかったが、前回ログイン済みのユーザーとしてローカルの
+      // データだけで続行する。Realtime購読・リモート読み込みは、次にオンラインに
+      // なった際のconnectSupabaseの再試行に任せる(ここでは試みない)。
+      useOutlineStore.setState({ userId, authChecked: true, offlineBoot: true, syncStatus: "offline" });
       return false;
     }
     await completeAuthentication(userId);
