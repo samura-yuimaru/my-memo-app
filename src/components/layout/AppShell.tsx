@@ -7,6 +7,7 @@ import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { OutlineToolbar } from "./OutlineToolbar";
 import { UpdateBanner } from "./UpdateBanner";
+import { ConfirmHost } from "@/components/ui/confirmDialog";
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 440;
@@ -133,6 +134,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </main>
         <OutlineToolbar />
       </div>
+      <ConfirmHost />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { FilePlus2, FolderPlus } from "lucide-react";
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
+import { confirmDialog } from "@/components/ui/confirmDialog";
 import { BrandHeader } from "./BrandHeader";
 import { FolderNode } from "./FolderNode";
 import { NoteRow } from "./NoteRow";
@@ -50,7 +51,11 @@ export function Sidebar({ onNavigate }: SidebarProps) {
   async function handleDeleteNote(e: React.MouseEvent, noteId: string, title: string) {
     e.preventDefault();
     e.stopPropagation();
-    const ok = window.confirm(`「${title || "無題のメモ"}」を削除します。よろしいですか?`);
+    const ok = await confirmDialog({
+      message: `「${title || "無題のメモ"}」を削除します。よろしいですか?`,
+      confirmLabel: "削除",
+      danger: true,
+    });
     if (!ok) return;
     await deleteNote(noteId);
     if (currentNoteId === noteId) router.push("/");

@@ -10,6 +10,7 @@ import { safeSetPointerCapture } from "@/lib/utils/dnd";
 import { writeToOsClipboard } from "@/lib/utils/clipboard";
 import { useLongPress } from "@/lib/utils/useLongPress";
 import { IconButton } from "@/components/ui/IconButton";
+import { confirmDialog } from "@/components/ui/confirmDialog";
 import { actionIconClass, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { ToggleArrow } from "./ToggleArrow";
 import { NodeEditor, type NodeEditorHandle } from "./NodeEditor";
@@ -72,12 +73,14 @@ export function OutlineNode({ node, depth, insideSmartBlock = false }: OutlineNo
   const isDropTarget = dragOver?.overId === node.id;
   const childInsideSmartBlock = insideSmartBlock || node.nodeType !== "normal";
 
-  function handleDelete() {
+  async function handleDelete() {
     if (hasChildren) {
       const preview = htmlToPlainText(node.content).slice(0, 20) || "このノード";
-      const ok = window.confirm(
-        `「${preview}」と配下の${descendantCount}件をまとめて削除します。よろしいですか?`
-      );
+      const ok = await confirmDialog({
+        message: `「${preview}」と配下の${descendantCount}件をまとめて削除します。よろしいですか?`,
+        confirmLabel: "削除",
+        danger: true,
+      });
       if (!ok) return;
     }
     deleteNode(node.id);

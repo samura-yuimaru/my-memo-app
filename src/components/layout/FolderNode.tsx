@@ -6,6 +6,7 @@ import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { IconButton } from "@/components/ui/IconButton";
 import { Popover } from "@/components/ui/Popover";
+import { confirmDialog } from "@/components/ui/confirmDialog";
 import { useRowDrag } from "@/lib/utils/useRowDrag";
 import { actionIconClass, NO_IOS_CALLOUT, SELECTED_BG_CLASS, SELECTED_TEXT_CLASS } from "@/lib/uiClasses";
 import { NoteRow } from "./NoteRow";
@@ -81,9 +82,11 @@ export function FolderNode({
 
   async function handleDelete() {
     setMenuOpen(false);
-    const ok = window.confirm(
-      `「${folder.name}」を削除します。サブフォルダも一緒に削除されますが、中のメモは「フォルダなし」に移動します。よろしいですか?`
-    );
+    const ok = await confirmDialog({
+      message: `「${folder.name}」を削除します。サブフォルダも一緒に削除されますが、中のメモは「フォルダなし」に移動します。よろしいですか?`,
+      confirmLabel: "削除",
+      danger: true,
+    });
     if (!ok) return;
     await deleteFolder(folder.id);
   }

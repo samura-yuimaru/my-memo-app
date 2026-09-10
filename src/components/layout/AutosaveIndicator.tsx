@@ -5,6 +5,7 @@ import { AlertTriangle, CheckCircle2, Download, HardDrive, LogOut, Loader2, Refr
 import clsx from "clsx";
 import { useOutlineStore } from "@/lib/store/useOutlineStore";
 import { Popover } from "@/components/ui/Popover";
+import { confirmDialog } from "@/components/ui/confirmDialog";
 
 /** 「○分前」/ 今日の時刻(HH:mm:ss)で最終同期時刻を表す */
 function formatLastSynced(iso: string): string {
@@ -19,21 +20,13 @@ function formatLastSynced(iso: string): string {
 }
 
 /**
- * 画面隅に常駐する「データ保護ステータス」の☑マーク。タップすると、最終同期時刻の確認と
- * JSONでの書き出し/読み込み(バックアップ・機種変更時の引き継ぎ)ができるパネルを開く。
- *
- * 表示状態は、次のすべてが一致してはじめて「クラウド同期済み」を名乗る:
- *   1) Supabaseが設定されている(supabaseReady)
- *   2) ログイン済みである(userId が非null)
- *   3) オンラインである(isOnline)
- *   4) 実際に書き込みが完了している(syncStatusが"saving"/"error"ではなく、
- *      ローカルの未送信キューが0件 = pendingCount === 0)
- * これらのどれか一つでも欠けている間は、絶対に緑の「クラウド同期済み」を名乗らない
- * (以前は supabaseReady と userId の状態を見ずに緑チェックを出してしまい、
- *  「緑なのに端末保存のみ/未同期」という表示の不整合が起きていたための修正)。
- *
- * 色: 緑=クラウド同期済み / 青回転=同期中・接続中 / 黄=オフライン / 赤=同期エラー /
- *     グレー=Supabase未設定(端末のみ、クラウド同期の対象外)
+ * ヘッダー隅の同期ステータス。「保存を意識しなくていい」体験を邪魔しないよう、
+ * ふだん(正常時)はごく控えめな表示にとどめ、目を引くのは「要対応(オフライン/
+ * 同期エラー)」のときだけにする。3状態:
+ *   - ok      … 正常(クラウド同期済み、またはローカル専用モード)。淡色で控えめ
+ *   - working … 送信中・接続確認中・送信待ちあり。淡色のスピナー
+ *   - attention … オフライン / 同期エラー。はっきりした警告色
+ * タップで開くパネルに、最終同期時刻・再接続・JSON書き出し/読み込み・ログアウトを集約する。
  */
 export function AutosaveIndicator() {
   const syncStatus = useOutlineStore((s) => s.syncStatus);
@@ -69,14 +62,7 @@ export function AutosaveIndicator() {
   const showReconnect = supabaseReady && !reconnecting && (syncStatus === "error" || !userId);
 
   const view = (() => {
-    if (syncStatus === "saving") {
-      return {
-        icon: <Loader2 size={16} className="animate-spin" />,
-        label: "同期中…",
-        detail: "クラウドへ保存しています",
-        className: "text-sky-600 dark:text-sky-300",
-      };
-    }
+    // 要対応: オフライン / 同期エラー ―ここだけはっきり見せる
     if (syncStatus === "error") {
       return {
         icon: <AlertTriangle size={16} />,
@@ -85,15 +71,7 @@ export function AutosaveIndicator() {
         className: "text-rose-600 dark:text-rose-300",
       };
     }
-    if (!supabaseReady) {
-      return {
-        icon: <HardDrive size={16} />,
-        label: "端末のみに保存(ローカル専用)",
-        detail: "Supabase未設定のため、この端末のみに自動保存されています",
-        className: "text-ink-500",
-      };
-    }
-    if (!isOnline) {
+    if (supabaseReady && !isOnline) {
       return {
         icon: <AlertTriangle size={16} />,
         label: "オフライン",
@@ -101,27 +79,34 @@ export function AutosaveIndicator() {
         className: "text-amber-500 dark:text-amber-300",
       };
     }
-    if (!userId || reconnecting) {
+    // 作業中: 送信中 / 接続確認中 / 送信待ちあり ―控えめなスピナー
+    if (syncStatus === "saving" || (supabaseReady && (!userId || reconnecting)) || pendingCount > 0) {
       return {
         icon: <Loader2 size={16} className="animate-spin" />,
-        label: "Supabaseに接続中…",
-        detail: "ログイン状態を確認しています",
-        className: "text-sky-600 dark:text-sky-300",
+        label: !userId || reconnecting ? "接続を確認中…" : "同期中…",
+        detail:
+          !userId || reconnecting
+            ? "ログイン状態を確認しています"
+            : pendingCount > 0
+            ? `クラウドへの送信待ちが${pendingCount}件あります`
+            : "クラウドへ保存しています",
+        className: "text-ink-400",
       };
     }
-    if (pendingCount > 0) {
+    // 正常: ふだんはほぼ主張しない
+    if (!supabaseReady) {
       return {
-        icon: <Loader2 size={16} className="animate-spin" />,
-        label: "同期中…",
-        detail: `クラウドへの送信待ちが${pendingCount}件あります`,
-        className: "text-sky-600 dark:text-sky-300",
+        icon: <HardDrive size={16} />,
+        label: "この端末のみに保存",
+        detail: "Supabase未設定のため、この端末のみに自動保存されています(ログイン不要)",
+        className: "text-ink-400",
       };
     }
     return {
       icon: <CheckCircle2 size={16} />,
-      label: "クラウド同期済み(Supabase)",
+      label: "同期済み",
       detail: "端末とSupabaseの両方に自動保存・同期済みです",
-      className: "text-emerald-600 dark:text-emerald-300",
+      className: "text-ink-400",
     };
   })();
 
@@ -149,7 +134,11 @@ export function AutosaveIndicator() {
   }
 
   async function handleSignOut() {
-    const ok = window.confirm("ログアウトします。この端末のメモはそのまま残りますが、再度ログインするまでクラウド同期は止まります。よろしいですか?");
+    const ok = await confirmDialog({
+      message:
+        "ログアウトします。この端末のメモはそのまま残りますが、再度ログインするまでクラウド同期は止まります。よろしいですか?",
+      confirmLabel: "ログアウト",
+    });
     if (!ok) return;
     setOpen(false);
     await signOut();
