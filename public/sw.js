@@ -1,25 +1,25 @@
 // ============================================================
 // OutLiner: 最小限のオフライン起動対応サービスワーカー
 // ============================================================
-// 方針はあえて単純にしてある(ミニマル・個人利用前提):
-// 事前キャッシュリストは持たず、「オンライン中に実際に開いたページ・ファイルを
-// その都度キャッシュしておき、オフライン時はそのキャッシュを返す」だけ
-// (ネットワーク優先・失敗時のみキャッシュにフォールバック)。
+// 目的は「ネットが無い状態でアプリのアイコンを開いても、真っ白/エラーにならず
+// 外枠(JS/CSS/画面の骨組み)だけは表示できるようにする」の一点のみ。
+// データの保存・同期(Supabase / IndexedDB)には一切関与しない。
 //
-// これにより、Supabaseとの通信(ノート/フォルダの中身そのもの)には一切関与しない
-// ―データの保存・同期は既存のIndexedDBベースの仕組みがそのまま担当する。
-// ここが担当するのは「ネットが無い状態でアプリのアイコンを開いたときに、
-// 真っ白/エラー画面にならずアプリの外枠(JS/CSS/画面の骨組み)だけは
-// 表示できるようにする」という一点のみ。
+// キャッシュ方針は用途ごとに分けて、余計なキャッシュ書き込みを増やさない:
+//   - /_next/static/... (ビルドごとに名前が変わる不変ファイル)
+//       → キャッシュ優先。あればネットワークを待たずに即返す(再訪問が速くなる)。
+//         無いときだけ取得して保存する。
+//   - ページ遷移(HTMLドキュメント / RSC取得)
+//       → ネットワーク優先・失敗時のみキャッシュ。オンラインなら常に最新、
+//         オフラインなら最後に開けたものを返す。
+//   - それ以外(画像等)・別オリジン(Supabase等)
+//       → 何もしない(素通し)。
 //
-// 新しいデプロイのたびにこのファイルの内容(または末尾のバージョン番号)を
-// 変えると、activate時に古いキャッシュが破棄され、新しいアセットに
-// 入れ替わっていく。
+// デプロイのたびに CACHE_NAME を変えると、activate 時に古いキャッシュが破棄される。
 
-const CACHE_NAME = "outliner-offline-v1";
+const CACHE_NAME = "outliner-offline-v2";
 
 self.addEventListener("install", () => {
-  // 新しいバージョンのSWをできるだけ早く有効化する
   self.skipWaiting();
 });
 
@@ -32,14 +32,22 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+function isStaticAsset(url) {
+  return url.pathname.startsWith("/_next/static/");
+}
+
+function isPageRequest(request, url) {
+  if (request.mode === "navigate") return true;
+  // Next.js のクライアント遷移(RSC取得)。?_rsc= 付きのGET、または RSC ヘッダ付き
+  if (url.search.includes("_rsc=")) return true;
+  if (request.headers.get("RSC") === "1") return true;
+  return false;
+}
+
 self.addEventListener("fetch", (event) => {
   const { request } = event;
-
-  // 同一オリジンのGETリクエストだけを対象にする。
-  // Supabase(別オリジン)へのAPI/Realtime通信には一切関与しない
-  // ―関与すると、オフライン時の同期エラー処理(dirty化・再試行キュー)を
-  // このSWが横取りしてしまい、かえって挙動が複雑になるため。
   if (request.method !== "GET") return;
+
   let url;
   try {
     url = new URL(request.url);
@@ -48,27 +56,44 @@ self.addEventListener("fetch", (event) => {
   }
   if (url.origin !== self.location.origin) return;
 
-  event.respondWith(
-    fetch(request)
-      .then((response) => {
-        // 成功したレスポンスは複製してキャッシュへ保存しておく
-        // (次回オフラインになったときのフォールバック用)
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(request, copy).catch(() => {
-            // opaque response等、キャッシュできない種類のレスポンスは黙って諦める
-          });
-        });
-        return response;
-      })
-      .catch(async () => {
-        const cached = await caches.match(request, { ignoreSearch: false });
+  // --- 不変の静的アセット: キャッシュ優先 ---
+  if (isStaticAsset(url)) {
+    event.respondWith(
+      caches.match(request).then((cached) => {
         if (cached) return cached;
-        // 完全一致(クエリ文字列込み)が無ければ、クエリ文字列を無視した一致も試す
-        // (Next.jsのRSCナビゲーションはビルドごとに変わるクエリ付きURLを使うため)
-        const cachedIgnoringSearch = await caches.match(request, { ignoreSearch: true });
-        if (cachedIgnoringSearch) return cachedIgnoringSearch;
-        return Response.error();
+        return fetch(request).then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, copy).catch(() => {}));
+          }
+          return res;
+        });
       })
-  );
+    );
+    return;
+  }
+
+  // --- ページ遷移: ネットワーク優先・失敗時キャッシュ ---
+  if (isPageRequest(request, url)) {
+    event.respondWith(
+      fetch(request)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, copy).catch(() => {}));
+          }
+          return res;
+        })
+        .catch(async () => {
+          const exact = await caches.match(request);
+          if (exact) return exact;
+          const loose = await caches.match(request, { ignoreSearch: true });
+          if (loose) return loose;
+          return Response.error();
+        })
+    );
+    return;
+  }
+
+  // --- それ以外: 素通し(キャッシュしない) ---
 });

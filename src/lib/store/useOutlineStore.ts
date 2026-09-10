@@ -71,6 +71,13 @@ import {
   dbDeleteNote as dbDeleteNoteLocal,
   type SyncTable,
 } from "@/lib/db/indexeddb";
+import { mergeByUpdatedAt, splitDeletedRows } from "./merge";
+import {
+  markDeleting,
+  unmarkDeleting,
+  isDeleting,
+  excludeDeleting,
+} from "./deleteGuard";
 
 /** メモの既定タイトル。1行目からのタイトル自動抽出は、この値のときだけ発動する */
 const DEFAULT_NOTE_TITLE = "無題のメモ";
@@ -265,21 +272,6 @@ function makeNode(partial: Partial<OutlineNodeData> & { noteId: string }): Outli
     createdAt: partial.createdAt ?? now,
     updatedAt: partial.updatedAt ?? now,
   };
-}
-
-function mergeByUpdatedAt<T extends { id: string; updatedAt: string }>(
-  local: T[],
-  remote: T[]
-): T[] {
-  const map = new Map<string, T>();
-  local.forEach((item) => map.set(item.id, item));
-  remote.forEach((item) => {
-    const existing = map.get(item.id);
-    if (!existing || existing.updatedAt < item.updatedAt) {
-      map.set(item.id, item);
-    }
-  });
-  return Array.from(map.values());
 }
 
 /**
@@ -1702,66 +1694,6 @@ function markKnownRemote(table: SyncTable, ids: Iterable<string>): void {
 
 function isKnownRemote(table: SyncTable, id: string): boolean {
   return knownRemoteIds.get(table)?.has(id) ?? false;
-}
-
-// ============================================================
-// 削除の「取りこぼし」防止
-// ============================================================
-// 削除の本体はサーバー側の論理削除(deleted_atへのUPDATE)であり、一度立った
-// deleted_atはどの端末・どのタイミングで取得しても一貫して「削除済み」を意味する
-// (splitDeletedRowsで振り分ける)。
-// ただし「ローカルで削除 → deleted_atのUPDATEがサーバーで確定」までのごく短い間だけは、
-// リモート/他タブから取り込んだ「まだdeleted_atが付いていない同じ行」を復活させて
-// しまう隙がある。そこを塞ぐためだけの、期限を持たない軽量ガード。
-// 削除開始時に登録し、削除同期の完了(成功=deleted_at確定、または失敗して再送キューへ
-// 登録)時に必ず外す。起動時は未送信の削除キュー(pendingDeletes)から復元する。
-const deletingIds = new Map<SyncTable, Set<string>>();
-
-/** 削除リクエストの送信を開始したidを記録する(通信の完了を待たず同期的に呼ぶ) */
-function markDeleting(table: SyncTable, ids: Iterable<string>): void {
-  let set = deletingIds.get(table);
-  if (!set) {
-    set = new Set();
-    deletingIds.set(table, set);
-  }
-  for (const id of ids) set.add(id);
-}
-
-/** 削除同期が完了(成功/再送キュー登録)したidを外す */
-function unmarkDeleting(table: SyncTable, ids: Iterable<string>): void {
-  const set = deletingIds.get(table);
-  if (!set) return;
-  for (const id of ids) set.delete(id);
-}
-
-/** そのidが、いま削除リクエスト送信中かどうか */
-function isDeleting(table: SyncTable, id: string): boolean {
-  return deletingIds.get(table)?.has(id) ?? false;
-}
-
-/** リモート/他タブから取得した行のうち、いま削除リクエストが送信中のものを除外する */
-function excludeDeleting<T extends { id: string }>(table: SyncTable, rows: T[]): T[] {
-  const set = deletingIds.get(table);
-  if (!set || set.size === 0) return rows;
-  return rows.filter((r) => !set.has(r.id));
-}
-
-/**
- * リモートから取得した生の行を、論理削除済み(deleted_atが設定済み)かどうかで
- * 振り分ける。削除は物理DELETEではなくdeleted_atへのUPDATEで表現しているため、
- * folders/notes一覧の再取得・開いているメモのnodes再取得のいずれも、必ずこれを
- * 通してから使う。deleted_atが設定された行はサーバー側で確定した削除記録。
- */
-function splitDeletedRows<R extends { id: string; deleted_at?: string | null }>(
-  rows: R[]
-): { alive: R[]; deletedIds: string[] } {
-  const alive: R[] = [];
-  const deletedIds: string[] = [];
-  for (const r of rows) {
-    if (r.deleted_at) deletedIds.push(r.id);
-    else alive.push(r);
-  }
-  return { alive, deletedIds };
 }
 
 /** 複数の新規行をまとめて1回のinsert([...])で送る(POSTリクエスト) */
