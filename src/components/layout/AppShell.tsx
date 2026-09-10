@@ -6,6 +6,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { OutlineToolbar } from "./OutlineToolbar";
+import { UpdateBanner } from "./UpdateBanner";
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 440;
@@ -121,6 +122,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       )}
 
       <div className="flex min-w-0 flex-1 flex-col">
+        <UpdateBanner />
         <Header
           onMenuClick={() => setMobileMenuOpen(true)}
           sidebarOpen={sidebarOpen}
