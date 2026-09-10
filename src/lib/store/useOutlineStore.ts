@@ -28,7 +28,7 @@ import {
   midpointPosition,
   sequentialPositions,
 } from "@/lib/utils/tree";
-import type { RealtimeChannel, RealtimePostgresChangesPayload, SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import {
   getExistingSession,
@@ -351,11 +351,12 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
         console.log("[Sync] オンラインに復帰しました");
         useOutlineStore.setState({ isOnline: true });
         // オンライン復帰時: まだ接続できていない、またはオフラインフォールバックで
-        // 起動しただけ(Realtime購読・リモート読み込みが未完了)であれば既存セッションの
-        // 確認からやり直し、完全に認証済みならそのまま未送信分をまとめて送る
+        // 起動しただけ(正式なセッション確認・リモート読み込みが未完了)であれば、
+        // セッション確認からリモート再取得までまとめてやり直す。完全に認証済みなら
+        // 未送信分をまとめて送りつつ、他端末の変更も取り込む。
         const s = useOutlineStore.getState();
-        if (!s.userId || s.offlineBoot) void connectSupabase();
-        else void flushPendingSync();
+        if (!s.userId || s.offlineBoot) void useOutlineStore.getState().reconnectSupabase();
+        else void refreshFromRemote();
       });
       window.addEventListener("offline", () => {
         console.log("[Sync] オフラインになりました");
@@ -407,8 +408,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       client.auth.onAuthStateChange((event, session) => {
         console.log("[Sync] 認証状態が変化しました:", event);
         if (event === "SIGNED_OUT") {
-          void teardownSyncChannel();
-          useOutlineStore.setState({ userId: null });
+          useOutlineStore.setState({ userId: null, offlineBoot: false });
           return;
         }
         if (event === "SIGNED_IN" && session?.user.id) {
@@ -567,8 +567,6 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       } else if (error) {
         devError("[sync] ノードの取得に失敗しました:", error.message);
       }
-      // nodesのRealtime購読はfolders/notesと同じ単一チャンネル(subscribeSyncChannel)が
-      // ユーザー全体を対象に常時張っているため、メモを開くたびに個別購読し直す必要はない
     }
 
     if (get().currentNoteId === noteId) {
@@ -1376,10 +1374,9 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
 
   signOut: async () => {
     console.log("[Sync] ログアウトします");
-    await teardownSyncChannel();
     await authSignOut();
     // 端末内のローカルデータ(IndexedDB)はそのまま残す。再ログインすればまた見える。
-    set({ userId: null, syncStatus: "idle" });
+    set({ userId: null, offlineBoot: false, syncStatus: "idle" });
   },
 
   exportSnapshot: async () => {
@@ -1464,140 +1461,17 @@ function parseOutlineSnapshot(data: unknown): OutlineSnapshot {
 // 永続化・同期処理(Supabase / IndexedDB)
 // ストアのactionsから呼ばれるが、循環参照を避けるためストア定義の外側に置く。
 // ============================================================
-
-/**
- * folders/notes/nodesの全変更を1本のRealtimeチャンネルにまとめて購読する
- * (テーブルごとに別チャンネルを張らない)。userIdが確定している間ずっと有効で、
- * 開いているメモに関わらず常時購読する。
- */
-let syncChannel: RealtimeChannel | null = null;
-let syncChannelUserId: string | null = null;
-let syncChannelReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-/** 切断/エラー検知後、再購読を試みるまでの待機時間。タイトな再接続ループを避ける */
-const SYNC_CHANNEL_RECONNECT_DELAY_MS = 2000;
-/**
- * subscribeSyncChannelの呼び出しを直列化するための鎖。
- * ログイン直後は「起動時の既存セッション確認(init内のgetExistingSession)」と
- * 「onAuthStateChangeのSIGNED_IN/INITIAL_SESSION通知」がほぼ同時に発火し、両方から
- * ほぼ同時にsubscribeSyncChannelが呼ばれることがある(開発モードのReact StrictMode
- * によるinit()の二重実行が重なると、さらに何重にもなることもある)。
- * teardown(removeChannel)の完了を待たずに次の購読が始まると、supabase-js側は
- * 同じトピック名の(まだ購読解除しきれていない)チャンネルを再利用してしまい、
- * そこへさらに.on()を呼ぶ形になって「cannot add postgres_changes callbacks ...
- * after subscribe()」という未捕捉の例外が起きていた。この鎖で「必ず前回の破棄が
- * 完了してから次の購読を始める」ことを保証する。
- */
-let syncChannelOpChain: Promise<void> = Promise.resolve();
-/**
- * チャンネルのトピック名に付ける連番。前のチャンネルがsupabase-js内部でまだ
- * 完全に破棄しきれていない(unsubscribe()が'ok'を返すまでjoin中は待たされる等)
- * 場合でも、トピック名を変えることで既存チャンネルの使い回しを避け、購読済みの
- * インスタンスに.on()を呼んでしまう事態そのものを起こらなくする(直列化と併用する
- * ことで二重の保険にしている)。
- */
-let syncChannelSeq = 0;
-
-/**
- * folders/notes/nodesの変更を1本のチャンネルで購読する。切断・タイムアウト・
- * エラー(CHANNEL_ERROR/TIMED_OUT/CLOSED)を検知した場合は、一定時間後に
- * 自動的に張り直す(userIdがまだ有効な間だけ)。
- * 呼び出し自体は同期的(fire-and-forget)だが、実際の張り替えはsyncChannelOpChainで
- * 直列化されるため、短時間に複数回呼ばれても競合しない。
- */
-function subscribeSyncChannel(userId: string): void {
-  syncChannelOpChain = syncChannelOpChain
-    .catch(() => {
-      // 前回の張り替えが失敗していても鎖を継続させる(今回の呼び出しは行う)
-    })
-    .then(() => subscribeSyncChannelSequential(userId));
-}
-
-async function subscribeSyncChannelSequential(userId: string): Promise<void> {
-  const client = getSupabaseClient();
-  if (!client) return;
-
-  await teardownSyncChannel();
-  // 直列待機している間にサインアウト/別ユーザーへの切替が起きていた場合は何もしない
-  if (useOutlineStore.getState().userId !== userId) return;
-  syncChannelUserId = userId;
-
-  console.log("[Sync] Realtimeチャンネルの購読を開始します userId=", userId);
-  syncChannelSeq += 1;
-  syncChannel = client
-    .channel(`sync-${userId}-${syncChannelSeq}`)
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "folders", filter: `user_id=eq.${userId}` },
-      handleFolderRealtimeChange
-    )
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "notes", filter: `user_id=eq.${userId}` },
-      handleNoteRealtimeChange
-    )
-    .on(
-      "postgres_changes",
-      { event: "*", schema: "public", table: "nodes", filter: `user_id=eq.${userId}` },
-      handleNodeRealtimeChange
-    )
-    .subscribe((status, err) => {
-      console.log("[Sync] Realtimeチャンネルの状態:", status, err?.message ?? "");
-      if (status === "SUBSCRIBED") {
-        if (syncChannelReconnectTimer) {
-          clearTimeout(syncChannelReconnectTimer);
-          syncChannelReconnectTimer = null;
-        }
-        return;
-      }
-      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-        scheduleSyncChannelReconnect(userId);
-      }
-    });
-}
-
-/** 切断/エラーを検知した際、少し待ってから自動的に再購読する(多重予約はしない) */
-function scheduleSyncChannelReconnect(userId: string): void {
-  if (syncChannelReconnectTimer) return;
-  console.log("[Sync] Realtimeチャンネルが切断/エラーになりました。再接続を予約します");
-  syncChannelReconnectTimer = setTimeout(() => {
-    syncChannelReconnectTimer = null;
-    // 待機中にサインアウト/別ユーザーへの切替が起きていないか確認してから張り直す
-    if (useOutlineStore.getState().userId === userId) {
-      subscribeSyncChannel(userId);
-    }
-  }, SYNC_CHANNEL_RECONNECT_DELAY_MS);
-}
-
-/**
- * サインアウト等でセッションが失われた際、Realtimeチャンネルを確実に解除する。
- * removeChannel()の完了を待ってから返す(呼び出し元のsubscribeSyncChannelSequentialが、
- * 破棄が完了しきる前に同じトピック名で次のチャンネルを作ってしまわないようにするため)。
- * サインアウト時など、完了を待たずに呼ぶだけの箇所ではPromiseを無視してよい。
- */
-async function teardownSyncChannel(): Promise<void> {
-  if (syncChannelReconnectTimer) {
-    clearTimeout(syncChannelReconnectTimer);
-    syncChannelReconnectTimer = null;
-  }
-  syncChannelUserId = null;
-  if (syncChannel) {
-    const client = getSupabaseClient();
-    const toRemove = syncChannel;
-    syncChannel = null;
-    if (client) {
-      try {
-        await client.removeChannel(toRemove);
-      } catch {
-        // 破棄に失敗しても致命的ではない(次に張るチャンネルはトピック名が同じままなので
-        // 多少残っていても実害は小さい。ここで例外を投げて呼び出し元の直列鎖を止めない)
-      }
-    }
-  }
-}
+//
+// 他端末(PC⇄iPad)での変更の取り込みは、以下の3経路だけで行う(WebSocketでの
+// リアルタイム購読は、複雑さ・不安定さの割に1人利用での恩恵が小さいため撤去した):
+//   1. アプリ起動時(init) … folders/notes一覧と現在のメモを取得
+//   2. タブ復帰・ウィンドウフォーカス時(refreshFromRemote) … 差分を取り込む
+//   3. 定期バックグラウンドリトライ … 未送信分の再送
+// 同一ブラウザの複数タブ間だけは、下のBroadcastChannelでネットワークを挟まず即時同期する。
 
 // ============================================================
-// BroadcastChannel: 同一ブラウザ内の複数タブ間を、Supabase Realtimeの往復
-// (ネットワークを挟むため数十〜数百ms)を待たずに即座(数ms)に同期する補強策。
+// BroadcastChannel: 同一ブラウザ内の複数タブ間を、ネットワークを挟まず
+// 即座(数ms)に同期する補強策。
 // 認証/オンライン状態に関わらず、ローカルへ書き込むたびに必ず送る
 // (オフライン中の編集も同一ブラウザの他タブへはこれで即時反映される)。
 // ============================================================
@@ -2367,8 +2241,9 @@ async function refreshPendingCount(): Promise<void> {
  */
 /**
  * 認証が確立した(ログイン成功・既存セッション発見・トークン再取得)直後に必ず行う
- * 共通処理: userIdを確定し、未送信分の同期キューを処理し、folders/notes/nodesを
- * まとめた単一Realtimeチャンネルの購読を開始して、クラウド同期済みの状態にする。
+ * 共通処理: userIdを確定し、未送信分の同期キューを処理して、クラウド同期済みの
+ * 状態にする。他端末での変更の取り込みは、呼び出し元(init/refreshFromRemote等)が
+ * folders/notes一覧・現在のメモの再取得として行う。
  */
 async function completeAuthentication(userId: string): Promise<void> {
   console.log("[Sync] 認証が確立しました userId=", userId);
@@ -2377,10 +2252,6 @@ async function completeAuthentication(userId: string): Promise<void> {
   }
   useOutlineStore.setState({ userId, authChecked: true, offlineBoot: false });
   await flushPendingSync();
-  // PC⇄iPad間・複数タブ間などの他端末/他タブでの変更をリアルタイムに拾うため、
-  // folders/notes/nodesをまとめた単一チャンネルの購読を開始する
-  // (画面全体の再取得は行わず、差分IDのみをピンポイントで反映する)
-  subscribeSyncChannel(userId);
   markSynced();
 }
 
@@ -2781,158 +2652,4 @@ export async function flushPendingSync(): Promise<void> {
   } else {
     console.log("[Sync] 同期キューは空でした(送信対象なし)");
   }
-}
-
-/**
- * nodesテーブルのRealtimeイベント(単一チャンネル内の1テーブル分)を処理する。
- * ユーザー全体のnodesを対象にするため、開いていないメモの行も届くが、
- * ローカルのstate.nodesを書き換えるのは現在開いているメモの分だけにする
- * (IndexedDBへの保存自体は開いていないメモの分も行い、次に開いたときに
- * 最新の内容がすぐ見えるようにする)。
- */
-function handleNodeRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
-  if (payload.eventType === "DELETE") {
-    const oldId = (payload.old as { id: string }).id;
-    markDeletedLocally("nodes", [oldId]);
-    useOutlineStore.setState((s) => {
-      if (!(oldId in s.nodes)) return s;
-      const next = { ...s.nodes };
-      delete next[oldId];
-      return { nodes: next };
-    });
-    void dbDeleteNode(oldId);
-    return;
-  }
-
-  const newRow = payload.new as unknown as NodeRow;
-  // 論理削除(deleted_atへのUPDATE)されたイベントは、物理DELETEと同じく「削除」として扱う
-  // (物理削除は使わなくなったため、削除は基本的にこちらの経路で届く)
-  if (newRow.deleted_at) {
-    const deletedId = newRow.id;
-    markDeletedLocally("nodes", [deletedId]);
-    useOutlineStore.setState((s) => {
-      if (!(deletedId in s.nodes)) return s;
-      const next = { ...s.nodes };
-      delete next[deletedId];
-      return { nodes: next };
-    });
-    void dbDeleteNode(deletedId);
-    return;
-  }
-
-  const incoming = nodeFromRow(newRow);
-  // ローカルで削除済み(tombstone)のidは、削除がまだサーバーに完全に伝播しきる前の
-  // 古いUPDATEイベント等で復活させないよう無視する
-  if (isTombstoned("nodes", incoming.id)) return;
-  // リアルタイムで受信した内容も、DOMへinnerHTMLとして描画する前に必ず
-  // サニタイズを通す(RLSで自分のデータしか流れてこないとはいえ、念のための多層防御)
-  incoming.content = sanitizeHtml(incoming.content);
-  markKnownRemote("nodes", [incoming.id]);
-  void dbPutNode(incoming);
-
-  const state = useOutlineStore.getState();
-  if (state.currentNoteId !== incoming.noteId) return;
-  const existing = state.nodes[incoming.id];
-  // 自分の書き込みのエコーや古い変更で上書きしないようにする
-  if (existing && existing.updatedAt >= incoming.updatedAt) return;
-  useOutlineStore.setState((s) => ({ nodes: { ...s.nodes, [incoming.id]: incoming } }));
-}
-
-/**
- * foldersテーブルのRealtimeイベントを処理する。別端末(PC等)でフォルダの追加・
- * 名前変更・移動・削除が行われた瞬間、画面全体を再取得することなく、差分の
- * あった1件だけをピンポイントでローカル(Zustand/IndexedDB)へ反映する。
- * 自分自身の書き込みが返ってきたエコーはupdatedAt比較で検知してスキップする。
- */
-function handleFolderRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
-  if (payload.eventType === "DELETE") {
-    const oldId = (payload.old as { id: string }).id;
-    markDeletedLocally("folders", [oldId]);
-    useOutlineStore.setState((s) => {
-      if (!s.folders.some((f) => f.id === oldId)) return s;
-      return { folders: s.folders.filter((f) => f.id !== oldId) };
-    });
-    void dbDeleteFolderLocal(oldId);
-    console.log("[Sync] 他端末でフォルダが削除されました:", oldId);
-    return;
-  }
-
-  const newFolderRow = payload.new as unknown as FolderRowType;
-  if (newFolderRow.deleted_at) {
-    const deletedId = newFolderRow.id;
-    markDeletedLocally("folders", [deletedId]);
-    useOutlineStore.setState((s) => {
-      if (!s.folders.some((f) => f.id === deletedId)) return s;
-      return { folders: s.folders.filter((f) => f.id !== deletedId) };
-    });
-    void dbDeleteFolderLocal(deletedId);
-    console.log("[Sync] 他端末でフォルダが削除されました:", deletedId);
-    return;
-  }
-
-  const incoming = folderFromRow(newFolderRow);
-  if (isTombstoned("folders", incoming.id)) return;
-  const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
-  if (existing && existing.updatedAt >= incoming.updatedAt) return;
-
-  markKnownRemote("folders", [incoming.id]);
-  useOutlineStore.setState((s) => ({
-    folders: sortFolders(
-      existing ? s.folders.map((f) => (f.id === incoming.id ? incoming : f)) : [...s.folders, incoming]
-    ),
-  }));
-  void dbPutFolder(incoming);
-  console.log("[Sync] 他端末でのフォルダの変更を反映しました:", incoming.id);
-}
-
-/**
- * notesテーブルのRealtimeイベントを処理する。別端末での新規作成・タイトル変更・
- * フォルダ移動・削除を、差分のあった1件だけピンポイントでローカルへ反映する。
- * 今開いているメモ自体が他端末で削除された場合は、安全のためメモを閉じる。
- */
-function handleNoteRealtimeChange(payload: RealtimePostgresChangesPayload<Record<string, unknown>>): void {
-  if (payload.eventType === "DELETE") {
-    const oldId = (payload.old as { id: string }).id;
-    markDeletedLocally("notes", [oldId]);
-    useOutlineStore.setState((s) => {
-      if (!s.notesList.some((n) => n.id === oldId)) return s;
-      return {
-        notesList: s.notesList.filter((n) => n.id !== oldId),
-        ...(s.currentNoteId === oldId ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
-      };
-    });
-    void dbDeleteNoteLocal(oldId);
-    console.log("[Sync] 他端末でメモが削除されました:", oldId);
-    return;
-  }
-
-  const newNoteRow = payload.new as unknown as NoteRowType;
-  if (newNoteRow.deleted_at) {
-    const deletedId = newNoteRow.id;
-    markDeletedLocally("notes", [deletedId]);
-    useOutlineStore.setState((s) => {
-      if (!s.notesList.some((n) => n.id === deletedId)) return s;
-      return {
-        notesList: s.notesList.filter((n) => n.id !== deletedId),
-        ...(s.currentNoteId === deletedId ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
-      };
-    });
-    void dbDeleteNoteLocal(deletedId);
-    console.log("[Sync] 他端末でメモが削除されました:", deletedId);
-    return;
-  }
-
-  const incoming = noteFromRow(newNoteRow);
-  if (isTombstoned("notes", incoming.id)) return;
-  const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
-  if (existing && existing.updatedAt >= incoming.updatedAt) return;
-
-  markKnownRemote("notes", [incoming.id]);
-  useOutlineStore.setState((s) => ({
-    notesList: sortNotes(
-      existing ? s.notesList.map((n) => (n.id === incoming.id ? incoming : n)) : [...s.notesList, incoming]
-    ),
-  }));
-  void dbPutNote(incoming);
-  console.log("[Sync] 他端末でのメモの変更を反映しました:", incoming.id);
 }
