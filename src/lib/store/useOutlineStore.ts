@@ -440,12 +440,11 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     }
     set({ authChecked: true });
 
-    // 前回セッションで未送信のまま残っている削除キューをtombstoneへ先読みしておく。
-    // これを飛ばして直接loadFolders/loadNotesListを呼ぶと、まだサーバーに送信できて
-    // いない削除対象がここでの再取得によって復活してしまう(削除の取りこぼしの
-    // 起動時バージョン)。
+    // 前回セッションで送信できずに残っている削除待ちを、復活防止ガードへ復元しておく。
+    // これを飛ばして直接loadFolders/loadNotesListを呼ぶと、まだサーバー側で
+    // deleted_atが立っていない削除対象を再取得で拾って復活させてしまう。
     const pendingDeletesAtStartup = await dbGetPendingDeletes();
-    for (const pd of pendingDeletesAtStartup) markDeletedLocally(pd.table, [pd.recordId]);
+    for (const pd of pendingDeletesAtStartup) markDeleting(pd.table, [pd.recordId]);
 
     console.log("[Sync] フォルダ/メモ一覧の読み込みを開始します");
     await Promise.all([get().loadFolders(), get().loadNotesList()]);
@@ -473,11 +472,11 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     }
     const { alive, deletedIds } = splitDeletedRows((data ?? []) as FolderRowType[]);
     // サーバー側で論理削除済み(deleted_at設定済み)の行は、ローカルに残っていれば
-    // 確実に取り除く。deleted_atはサーバー発の永続的な削除記録なので、tombstoneの
-    // 有効期限や端末ローカルの記憶に頼らず、どの端末・どのタイミングで同期しても一貫する
+    // 確実に取り除く。deleted_atはサーバー発の永続的な削除記録なので、端末ローカルの一時的な記憶に
+    // 頼らず、どの端末・どのタイミングで同期しても一貫する
     if (deletedIds.length > 0) await Promise.all(deletedIds.map((id) => dbDeleteFolderLocal(id)));
     const localAlive = local.filter((f) => !deletedIds.includes(f.id));
-    const remoteFolders = excludeTombstoned("folders", alive.map(folderFromRow));
+    const remoteFolders = excludeDeleting("folders", alive.map(folderFromRow));
     markKnownRemote(
       "folders",
       remoteFolders.map((f) => f.id)
@@ -506,7 +505,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
     const { alive, deletedIds } = splitDeletedRows((data ?? []) as NoteRowType[]);
     if (deletedIds.length > 0) await Promise.all(deletedIds.map((id) => dbDeleteNoteLocal(id)));
     const localAlive = local.filter((n) => !deletedIds.includes(n.id));
-    const remoteNotes = excludeTombstoned("notes", alive.map(noteFromRow));
+    const remoteNotes = excludeDeleting("notes", alive.map(noteFromRow));
     markKnownRemote(
       "notes",
       remoteNotes.map((n) => n.id)
@@ -549,7 +548,7 @@ export const useOutlineStore = create<OutlineState>()((set, get) => ({
       if (!error && data) {
         const { alive, deletedIds } = splitDeletedRows(data as NodeRow[]);
         if (deletedIds.length > 0) await dbDeleteNodes(deletedIds);
-        const remoteNodes = excludeTombstoned("nodes", alive.map(nodeFromRow));
+        const remoteNodes = excludeDeleting("nodes", alive.map(nodeFromRow));
         markKnownRemote(
           "nodes",
           remoteNodes.map((n) => n.id)
@@ -1520,14 +1519,14 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
   if (message.table === "folders") {
     if (message.op === "delete") {
       // 他タブでの削除も、このタブが同時に行っているかもしれないリモート再取得が
-      // 復活させてしまわないようtombstoneへ記録する
-      markDeletedLocally("folders", [message.id]);
+      // 復活させてしまわないよう、送信中ガードへ記録する
+      markDeleting("folders", [message.id]);
       useOutlineStore.setState((s) => ({ folders: s.folders.filter((f) => f.id !== message.id) }));
       void dbDeleteFolderLocal(message.id);
       return;
     }
     const incoming = message.row;
-    if (isTombstoned("folders", incoming.id)) return;
+    if (isDeleting("folders", incoming.id)) return;
     const existing = useOutlineStore.getState().folders.find((f) => f.id === incoming.id);
     if (existing && existing.updatedAt >= incoming.updatedAt) return;
     useOutlineStore.setState((s) => ({
@@ -1541,7 +1540,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
 
   if (message.table === "notes") {
     if (message.op === "delete") {
-      markDeletedLocally("notes", [message.id]);
+      markDeleting("notes", [message.id]);
       useOutlineStore.setState((s) => ({
         notesList: s.notesList.filter((n) => n.id !== message.id),
         ...(s.currentNoteId === message.id ? { currentNoteId: null, nodes: {}, activeNodeId: null } : {}),
@@ -1550,7 +1549,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
       return;
     }
     const incoming = message.row;
-    if (isTombstoned("notes", incoming.id)) return;
+    if (isDeleting("notes", incoming.id)) return;
     const existing = useOutlineStore.getState().notesList.find((n) => n.id === incoming.id);
     if (existing && existing.updatedAt >= incoming.updatedAt) return;
     useOutlineStore.setState((s) => ({
@@ -1564,7 +1563,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
 
   // table === "nodes"
   if (message.op === "delete") {
-    markDeletedLocally("nodes", [message.id]);
+    markDeleting("nodes", [message.id]);
     void dbDeleteNode(message.id);
     useOutlineStore.setState((s) => {
       if (!(message.id in s.nodes)) return s;
@@ -1575,7 +1574,7 @@ function handleBroadcastMessage(message: BroadcastMessage): void {
     return;
   }
   const incoming = message.row;
-  if (isTombstoned("nodes", incoming.id)) return;
+  if (isDeleting("nodes", incoming.id)) return;
   void dbPutNode(incoming);
   const state = useOutlineStore.getState();
   if (state.currentNoteId !== incoming.noteId) return;
@@ -1706,68 +1705,52 @@ function isKnownRemote(table: SyncTable, id: string): boolean {
 }
 
 // ============================================================
-// 削除の「取りこぼし」防止(tombstone)
-// ローカルで削除した直後、まだサーバー側の削除リクエストが完了していないうちに
-// リモートからの再取得(タブ復帰時のrefreshFromRemote、Realtime、他タブからの
-// BroadcastChannel等)が割り込むと、mergeByUpdatedAtは「ローカルに存在しない=
-// 削除された」ことを表現できず、削除したはずの行がまだサーバー上に残っているのを
-// 拾って復活させてしまう(バグ票の「削除した数秒後に再表示される」の直接原因)。
-// これを防ぐため、削除操作を開始した瞬間に(通信の完了を待たず同期的に)その行を
-// tombstoneへ記録し、リモート/他タブ由来のデータをローカルへ取り込むすべての経路で
-// 必ずここを通して除外する。一定時間経過したエントリは削除が確実に完了している
-// 前提で自動的に無効化する(遅延読み取り時にその場で捨てる簡易クリーンアップ)。
+// 削除の「取りこぼし」防止
 // ============================================================
-const TOMBSTONE_TTL_MS = 5 * 60 * 1000; // 5分あれば通常の削除リクエストは確実に完了している
-const tombstones = new Map<SyncTable, Map<string, number>>();
+// 削除の本体はサーバー側の論理削除(deleted_atへのUPDATE)であり、一度立った
+// deleted_atはどの端末・どのタイミングで取得しても一貫して「削除済み」を意味する
+// (splitDeletedRowsで振り分ける)。
+// ただし「ローカルで削除 → deleted_atのUPDATEがサーバーで確定」までのごく短い間だけは、
+// リモート/他タブから取り込んだ「まだdeleted_atが付いていない同じ行」を復活させて
+// しまう隙がある。そこを塞ぐためだけの、期限を持たない軽量ガード。
+// 削除開始時に登録し、削除同期の完了(成功=deleted_at確定、または失敗して再送キューへ
+// 登録)時に必ず外す。起動時は未送信の削除キュー(pendingDeletes)から復元する。
+const deletingIds = new Map<SyncTable, Set<string>>();
 
-/** idの集合を「ローカルで削除済み」として記録する。削除操作の一番最初に、通信を待たず同期的に呼ぶこと */
-function markDeletedLocally(table: SyncTable, ids: Iterable<string>): void {
-  let set = tombstones.get(table);
+/** 削除リクエストの送信を開始したidを記録する(通信の完了を待たず同期的に呼ぶ) */
+function markDeleting(table: SyncTable, ids: Iterable<string>): void {
+  let set = deletingIds.get(table);
   if (!set) {
-    set = new Map();
-    tombstones.set(table, set);
+    set = new Set();
+    deletingIds.set(table, set);
   }
-  const now = Date.now();
-  for (const id of ids) set.set(id, now);
+  for (const id of ids) set.add(id);
 }
 
-/** サーバー側の削除が確認できた等、tombstoneを保持し続ける必要が無くなった際に個別解除する(必須ではないがマップの肥大化を防ぐ) */
-function clearTombstone(table: SyncTable, ids: Iterable<string>): void {
-  const set = tombstones.get(table);
+/** 削除同期が完了(成功/再送キュー登録)したidを外す */
+function unmarkDeleting(table: SyncTable, ids: Iterable<string>): void {
+  const set = deletingIds.get(table);
   if (!set) return;
   for (const id of ids) set.delete(id);
 }
 
-function isTombstoned(table: SyncTable, id: string): boolean {
-  const set = tombstones.get(table);
-  if (!set) return false;
-  const at = set.get(id);
-  if (at === undefined) return false;
-  if (Date.now() - at > TOMBSTONE_TTL_MS) {
-    set.delete(id);
-    return false;
-  }
-  return true;
+/** そのidが、いま削除リクエスト送信中かどうか */
+function isDeleting(table: SyncTable, id: string): boolean {
+  return deletingIds.get(table)?.has(id) ?? false;
 }
 
-/**
- * リモート/他タブから取得した行のうち、ローカルで削除済み(tombstone)のものを除外する。
- * folders/notes一覧の再取得、開いているメモのnodes再取得、Realtimeでの受信、
- * BroadcastChannelでの受信など、外部由来のデータをローカルへ反映するすべての経路で
- * 必ずこれを通し、削除が復活しないようにする。
- */
-function excludeTombstoned<T extends { id: string }>(table: SyncTable, rows: T[]): T[] {
-  const set = tombstones.get(table);
+/** リモート/他タブから取得した行のうち、いま削除リクエストが送信中のものを除外する */
+function excludeDeleting<T extends { id: string }>(table: SyncTable, rows: T[]): T[] {
+  const set = deletingIds.get(table);
   if (!set || set.size === 0) return rows;
-  return rows.filter((r) => !isTombstoned(table, r.id));
+  return rows.filter((r) => !set.has(r.id));
 }
 
 /**
  * リモートから取得した生の行を、論理削除済み(deleted_atが設定済み)かどうかで
  * 振り分ける。削除は物理DELETEではなくdeleted_atへのUPDATEで表現しているため、
  * folders/notes一覧の再取得・開いているメモのnodes再取得のいずれも、必ずこれを
- * 通してから使う。deleted_atが設定された行はサーバー側で確定した削除記録であり、
- * クライアント側のtombstone(有効期限あり・端末ローカルのみ)より優先して信頼できる。
+ * 通してから使う。deleted_atが設定された行はサーバー側で確定した削除記録。
  */
 function splitDeletedRows<R extends { id: string; deleted_at?: string | null }>(
   rows: R[]
@@ -2015,6 +1998,24 @@ const SYNC_TABLE_DEPENDS_ON: Partial<Record<SyncTable, SyncTable>> = {
  */
 const inFlightTableFlush = new Map<SyncTable, Promise<void>>();
 
+/**
+ * そのテーブルへの送信が今まさに進行中(HTTPレスポンス待ち)なら、その完了を待つ。
+ * 削除は「まだサーバーに存在しない行へのdeleted_at UPDATE」だと0件更新で空振りし、
+ * その後に遅れて届いた新規作成のupsertで行が復活してしまう。削除リクエストの直前に
+ * これを挟むことで、進行中の新規作成を先に確定させてからUPDATEを撃てるようにする
+ * (まだ送信していない分はcancelQueuedSyncが取り消すので、両方合わせて隙が無くなる)。
+ */
+async function awaitInFlightFlush(table: SyncTable): Promise<void> {
+  const inFlight = inFlightTableFlush.get(table);
+  if (inFlight) {
+    try {
+      await inFlight;
+    } catch {
+      // 進行中の送信が失敗しても、削除自体は続行する(こちらでdeleted_atを立てる)
+    }
+  }
+}
+
 /** キューに溜まった特定テーブルの全行を、insert/updateへ振り分けてまとめて送信する */
 async function flushTableQueue(table: SyncTable): Promise<void> {
   // 親テーブル(folders→notes→nodes)がまだキューに残っている、または送信中(HTTPの
@@ -2122,7 +2123,7 @@ async function refreshCurrentNoteNodesFromRemote(noteId: string): Promise<void> 
   if (!data) return;
   const { alive, deletedIds } = splitDeletedRows(data as NodeRow[]);
   if (deletedIds.length > 0) await dbDeleteNodes(deletedIds);
-  const remoteNodes = excludeTombstoned("nodes", alive.map(nodeFromRow));
+  const remoteNodes = excludeDeleting("nodes", alive.map(nodeFromRow));
   markKnownRemote(
     "nodes",
     remoteNodes.map((n) => n.id)
@@ -2405,9 +2406,9 @@ async function persistNode(node: OutlineNodeData): Promise<void> {
 
 async function persistDeleteNodes(ids: string[], noteId?: string | null): Promise<void> {
   if (ids.length === 0) return;
-  // 通信の完了を待たず、まず同期的にtombstone登録する(この直後に割り込むリモート
-  // 再取得が、まだサーバー上に残っているこの行を復活させてしまうのを防ぐため)
-  markDeletedLocally("nodes", ids);
+  // 通信の完了を待たず、まず同期的に「送信中ガード」へ登録する(deleted_atが
+  // サーバーで確定するまでの間に割り込むリモート再取得での復活を防ぐため)
+  markDeleting("nodes", ids);
   // 削除の直前の編集がまだ送信待ち(デバウンス中)で残っていると、数秒後に古い内容が
   // そのまま送られて削除状態を崩す入り口になるため、削除するidの分は確実に取り消す
   cancelQueuedSync("nodes", ids);
@@ -2432,6 +2433,8 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
   // (PostgRESTのアップサートはリクエストに含めた列しか更新しないため)。
   // 複数件まとめて削除する場合も、渡されたid全件を対象にする(先頭1件だけだと
   // 残りが同期時に復活して見えてしまうため)。
+  // 進行中の新規作成/更新の送信があれば先に確定させてからUPDATEを撃つ。
+  await awaitInFlightFlush("nodes");
   const { error } = await safeCall(() =>
     client.from("nodes").update({ deleted_at: nowIso() }).in("id", ids)
   );
@@ -2441,7 +2444,7 @@ async function persistDeleteNodes(ids: string[], noteId?: string | null): Promis
     useOutlineStore.setState({ syncStatus: "error" });
   } else {
     markSynced();
-    clearTombstone("nodes", ids);
+    unmarkDeleting("nodes", ids);
   }
 }
 
@@ -2467,9 +2470,9 @@ async function persistNote(note: NoteData): Promise<void> {
 }
 
 async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise<void> {
-  // ノード削除と同様、通信を待たず同期的にtombstone登録してから実際の削除に入る
-  markDeletedLocally("notes", [noteId]);
-  markDeletedLocally("nodes", nodeIds);
+  // ノード削除と同様、通信を待たず同期的に「送信中ガード」へ登録してから実際の削除に入る
+  markDeleting("notes", [noteId]);
+  markDeleting("nodes", nodeIds);
   cancelQueuedSync("notes", [noteId]);
   cancelQueuedSync("nodes", nodeIds);
   await dbDeleteNodes(nodeIds);
@@ -2487,6 +2490,9 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
   }
   // 物理削除ではなくdeleted_atへのUPDATEにしたため、on delete cascadeには頼れない
   // (UPDATEはカスケードを起こさない)。notesとnodes、両方へ明示的にdeleted_atを立てる。
+  // 進行中の新規作成/更新の送信があれば先に確定させてからUPDATEを撃つ(0件更新で空振り→
+  // 遅れて届いた作成で復活、を防ぐ)。
+  await Promise.all([awaitInFlightFlush("notes"), awaitInFlightFlush("nodes")]);
   const nowAt = nowIso();
   const [noteResult, nodesResult] = await Promise.all([
     safeCall(() => client.from("notes").update({ deleted_at: nowAt }).eq("id", noteId)),
@@ -2498,13 +2504,13 @@ async function persistDeleteNoteFull(noteId: string, nodeIds: string[]): Promise
     devError("[sync] メモの削除に失敗しました:", noteResult.error.message);
     await dbAddPendingDelete("notes", noteId);
   } else {
-    clearTombstone("notes", [noteId]);
+    unmarkDeleting("notes", [noteId]);
   }
   if (nodesResult.error) {
     devError("[sync] メモ配下ノードの削除に失敗しました:", nodesResult.error.message);
     await Promise.all(nodeIds.map((id) => dbAddPendingDelete("nodes", id)));
   } else {
-    clearTombstone("nodes", nodeIds);
+    unmarkDeleting("nodes", nodeIds);
   }
 }
 
@@ -2535,8 +2541,8 @@ async function persistFolder(folder: FolderData): Promise<void> {
  * on delete cascadeを起こさない ―配下フォルダの全idへ明示的にdeleted_atを立てる。
  */
 async function persistDeleteFolderFull(allIdsToDeleteLocally: string[]): Promise<void> {
-  // サブフォルダも含めた全idを、通信を待たず同期的にtombstone登録してから削除する
-  markDeletedLocally("folders", allIdsToDeleteLocally);
+  // サブフォルダも含めた全idを、通信を待たず同期的に「送信中ガード」へ登録してから削除する
+  markDeleting("folders", allIdsToDeleteLocally);
   cancelQueuedSync("folders", allIdsToDeleteLocally);
   await Promise.all(allIdsToDeleteLocally.map((id) => dbDeleteFolderLocal(id)));
   allIdsToDeleteLocally.forEach((id) => postBroadcast({ table: "folders", op: "delete", id }));
@@ -2548,6 +2554,8 @@ async function persistDeleteFolderFull(allIdsToDeleteLocally: string[]): Promise
     await Promise.all(allIdsToDeleteLocally.map((id) => dbAddPendingDelete("folders", id)));
     return;
   }
+  // 進行中の新規作成/更新の送信があれば先に確定させてからUPDATEを撃つ
+  await awaitInFlightFlush("folders");
   const { error } = await safeCall(() =>
     client.from("folders").update({ deleted_at: nowIso() }).in("id", allIdsToDeleteLocally)
   );
@@ -2555,7 +2563,7 @@ async function persistDeleteFolderFull(allIdsToDeleteLocally: string[]): Promise
     devError("[sync] フォルダの削除に失敗しました:", error.message);
     await Promise.all(allIdsToDeleteLocally.map((id) => dbAddPendingDelete("folders", id)));
   } else {
-    clearTombstone("folders", allIdsToDeleteLocally);
+    unmarkDeleting("folders", allIdsToDeleteLocally);
   }
 }
 
@@ -2596,6 +2604,8 @@ export async function flushPendingSync(): Promise<void> {
     );
     if (!error) {
       await Promise.all(items.map((it) => dbClearPendingDelete(it.key)));
+      // deleted_atが確定したので、復活防止の軽量ガードからも外す
+      unmarkDeleting(table, items.map((it) => it.recordId));
     } else {
       devError(`[sync] ${table}の削除キュー送信に失敗しました:`, error.message);
     }
