@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OUTLINER_CLIPBOARD_MIME, useOutlineStore } from "@/lib/store/useOutlineStore";
 import {
   buildPlainTextOutline,
+  buildSelectedForest,
   buildTree,
   getSiblings,
   isSelfOrDescendant,
@@ -37,6 +38,14 @@ export function Outliner() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const tree = useMemo(() => buildTree(Object.values(nodes)), [nodes]);
+  // 複数選択中のコピー/カットで書き出すプレーンテキスト。メモ全体(tree)ではなく、
+  // 選択されたノードだけを階層を保って抜き出す(buildSelectedForest)。以前はここで
+  // 誤って tree をそのまま渡しており、選択した数行のつもりがメモ全体をコピー
+  // してしまっていた(改行が大量に増えて見える不具合の原因だった)。
+  const selectedPlainText = useMemo(
+    () => buildPlainTextOutline(buildSelectedForest(Object.values(nodes), selectedNodeIds)),
+    [nodes, selectedNodeIds]
+  );
 
   // 行以外の余白部分(一覧の下の空きスペース等)をタップ/クリックすると選択を解除する。
   // マウスの範囲選択は行から始まるため誤って巻き込まれることはなく、タッチ操作で
@@ -50,19 +59,19 @@ export function Outliner() {
     [selectedNodeIds, clearNodeSelection]
   );
 
-  // メモ全体を選択している間(Notion風の2段階Ctrl+A、またはマウスドラッグでの範囲選択)は、
-  // コピーをブラウザ標準のテキスト選択ではなく、階層をインデントで表したプレーンテキストとして書き出す。
-  // 加えて、アプリ内貼り付け専用のカスタムMIME(OUTLINER_CLIPBOARD_MIME)にツリー構造(親子関係)を
-  // JSONで書き込んでおくことで、他アプリへは読みやすいプレーンテキストとして、
-  // このアプリ内へは階層を保ったまま貼り付けられる
+  // ノード単位で複数選択している間(Notion風の2段階Ctrl+A、またはマウスドラッグでの範囲選択)は、
+  // コピーをブラウザ標準のテキスト選択ではなく、選択範囲を階層をインデントで表した
+  // プレーンテキストとして書き出す。加えて、アプリ内貼り付け専用のカスタムMIME
+  // (OUTLINER_CLIPBOARD_MIME)にツリー構造(親子関係)をJSONで書き込んでおくことで、
+  // 他アプリへは読みやすいプレーンテキストとして、このアプリ内へは階層を保ったまま貼り付けられる
   const handleCopy = useCallback(
     (e: React.ClipboardEvent) => {
       if (selectedNodeIds.length === 0) return;
       e.preventDefault();
-      e.clipboardData.setData("text/plain", buildPlainTextOutline(tree));
+      e.clipboardData.setData("text/plain", selectedPlainText);
       e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, buildClipboardPayload(selectedNodeIds));
     },
-    [selectedNodeIds, tree, buildClipboardPayload]
+    [selectedNodeIds, selectedPlainText, buildClipboardPayload]
   );
 
   // カット: コピーと同じ内容をクリップボードへ書き込んでから、選択ノードを一括削除する
@@ -70,11 +79,11 @@ export function Outliner() {
     (e: React.ClipboardEvent) => {
       if (selectedNodeIds.length === 0) return;
       e.preventDefault();
-      e.clipboardData.setData("text/plain", buildPlainTextOutline(tree));
+      e.clipboardData.setData("text/plain", selectedPlainText);
       e.clipboardData.setData(OUTLINER_CLIPBOARD_MIME, buildClipboardPayload(selectedNodeIds));
       deleteNodesBulk(selectedNodeIds);
     },
-    [selectedNodeIds, tree, buildClipboardPayload, deleteNodesBulk]
+    [selectedNodeIds, selectedPlainText, buildClipboardPayload, deleteNodesBulk]
   );
 
   // アプリ内貼り付け: カスタムMIMEが載っていれば、通常のペースト処理(1行のプレーンテキスト
@@ -100,14 +109,14 @@ export function Outliner() {
   // キーボード操作だけで完結する)。
   const handleCopyShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
-  }, [selectedNodeIds, tree, buildClipboardPayload]);
+    void writeToOsClipboard(selectedPlainText, buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
+  }, [selectedNodeIds, selectedPlainText, buildClipboardPayload]);
 
   const handleCutShortcut = useCallback(() => {
     if (selectedNodeIds.length === 0) return;
-    void writeToOsClipboard(buildPlainTextOutline(tree), buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
+    void writeToOsClipboard(selectedPlainText, buildClipboardPayload(selectedNodeIds), OUTLINER_CLIPBOARD_MIME);
     deleteNodesBulk(selectedNodeIds);
-  }, [selectedNodeIds, tree, buildClipboardPayload, deleteNodesBulk]);
+  }, [selectedNodeIds, selectedPlainText, buildClipboardPayload, deleteNodesBulk]);
 
   // ------------------------------------------------------------
   // 行の並べ替え・スマート構造化ブロックへの出し入れ(ポインターイベント)

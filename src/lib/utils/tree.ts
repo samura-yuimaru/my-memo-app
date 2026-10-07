@@ -30,6 +30,42 @@ export function buildTree(nodes: OutlineNodeData[]): OutlineTreeNode[] {
   return roots;
 }
 
+/**
+ * 選択されたノード群(selectedIds)だけから成る「部分木の森」を組み立てる。
+ * 選択内の別ノードの子だったノードはその下にネストし、選択外のノードを親に持つ
+ * ノードは選択の「根っこ」としてトップレベルに並べる(buildClipboardPayloadの
+ * 階層復元ルールと同じ考え方)。並び順は position の再ソートではなく、
+ * selectedIds に渡された順序(= 画面表示順)をそのまま保つ。
+ *
+ * 複数ノードコピー時、階層を保ったプレーンテキスト(buildPlainTextOutline の入力)を
+ * 選択範囲だけに絞り込むために使う。これをせず buildTree の結果(メモ全体)を
+ * そのまま渡すと、選択した数行のつもりが文書全体がコピーされてしまう
+ * (「複数選択でコピーした内容がおかしい/改行が大量に増える」不具合の原因だった)。
+ */
+export function buildSelectedForest(
+  nodes: OutlineNodeData[],
+  selectedIds: string[]
+): OutlineTreeNode[] {
+  const idSet = new Set(selectedIds);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const treeNodes = new Map<string, OutlineTreeNode>();
+  for (const id of selectedIds) {
+    const n = byId.get(id);
+    if (n) treeNodes.set(id, { ...n, children: [] });
+  }
+
+  const roots: OutlineTreeNode[] = [];
+  for (const id of selectedIds) {
+    const treeNode = treeNodes.get(id);
+    if (!treeNode) continue;
+    const parentId = treeNode.parentId;
+    const parent = parentId && idSet.has(parentId) ? treeNodes.get(parentId) : undefined;
+    if (parent) parent.children.push(treeNode);
+    else roots.push(treeNode);
+  }
+  return roots;
+}
+
 /** 配下(子孫)の総ノード数を数える。折りたたみバッジ表示に使う */
 export function countDescendants(node: OutlineTreeNode): number {
   let count = node.children.length;

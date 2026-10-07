@@ -16,6 +16,7 @@ import {
   sanitizeHtml,
   setCaretOffset,
   splitHtmlAtOffset,
+  splitPastedLines,
 } from "@/lib/utils/richText";
 import { SELECTED_TEXT_HEX } from "@/lib/uiClasses";
 import type { ActiveColors } from "./NodeStylePopover";
@@ -347,9 +348,9 @@ export const NodeEditor = forwardRef<NodeEditorHandle, NodeEditorProps>(function
     const text = e.clipboardData.getData("text/plain");
     if (!text) return;
 
-    const lines = text.split(/\r\n|\r|\n/);
+    const lines = splitPastedLines(text);
     if (lines.length <= 1) {
-      document.execCommand("insertText", false, text);
+      document.execCommand("insertText", false, lines[0] ?? "");
       commitFromDom();
       return;
     }

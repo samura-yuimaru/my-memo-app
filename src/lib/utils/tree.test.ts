@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   buildTree,
+  buildSelectedForest,
+  buildPlainTextOutline,
   countDescendants,
   getSiblings,
   getPrevSibling,
@@ -142,5 +144,56 @@ describe("isSelfOrDescendant", () => {
   });
   it("無関係なノードは false", () => {
     expect(isSelfOrDescendant(nodes, "a", "b")).toBe(false);
+  });
+});
+
+describe("buildSelectedForest + buildPlainTextOutline(複数選択コピーの中核)", () => {
+  // 親子5件のメモの中から一部だけを選択するシナリオ(行A/行B/行C の3行構成)
+  const nodes = [
+    node({ id: "root", position: 10, content: "見出し" }),
+    node({ id: "a", parentId: "root", position: 10, content: "行A" }),
+    node({ id: "b", parentId: "root", position: 20, content: "行B" }),
+    node({ id: "b1", parentId: "b", position: 10, content: "行B子" }),
+    node({ id: "c", parentId: "root", position: 30, content: "行C" }),
+  ];
+
+  it("選択した行だけを抜き出す(メモ全体を巻き込まない)", () => {
+    const forest = buildSelectedForest(nodes, ["a", "b"]);
+    const ids = (list: typeof forest): string[] => list.flatMap((n) => [n.id, ...ids(n.children)]);
+    expect(ids(forest).sort()).toEqual(["a", "b"]);
+  });
+
+  it("選択内の親子関係は保ったまま、選択外の祖先(root)は含めない", () => {
+    const forest = buildSelectedForest(nodes, ["b", "b1"]);
+    expect(forest).toHaveLength(1);
+    expect(forest[0].id).toBe("b");
+    expect(forest[0].children.map((c) => c.id)).toEqual(["b1"]);
+  });
+
+  it("選択IDの渡された順序(画面表示順)を保つ", () => {
+    const forest = buildSelectedForest(nodes, ["c", "a"]);
+    expect(forest.map((n) => n.id)).toEqual(["c", "a"]);
+  });
+
+  it("プレーンテキストは選択した行数ぶんの改行だけになる(メモ全体の行数にならない)", () => {
+    const text = buildPlainTextOutline(buildSelectedForest(nodes, ["a", "b"]));
+    expect(text.split("\n")).toHaveLength(2);
+    expect(text).toContain("行A");
+    expect(text).toContain("行B");
+    expect(text).not.toContain("行C");
+    expect(text).not.toContain("見出し");
+  });
+
+  it("選択内の子はインデントされる", () => {
+    const text = buildPlainTextOutline(buildSelectedForest(nodes, ["b", "b1"]));
+    const lines = text.split("\n");
+    expect(lines[0]).toBe("行B");
+    expect(lines[1]).toBe("  行B子");
+  });
+
+  it("全選択(select all)相当なら従来どおりメモ全体になる", () => {
+    const allIds = nodes.map((n) => n.id);
+    const text = buildPlainTextOutline(buildSelectedForest(nodes, allIds));
+    expect(text.split("\n")).toHaveLength(nodes.length);
   });
 });

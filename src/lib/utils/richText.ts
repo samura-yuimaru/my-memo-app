@@ -213,6 +213,16 @@ export function escapeHtml(text: string): string {
   return div.innerHTML;
 }
 
+/**
+ * 貼り付けられたプレーンテキストを行に分割する。改行コード(CRLF/CR/LF)を統一し、
+ * 末尾の改行は取り除く(他アプリからのコピーは末尾に改行が付くことが多く、そのまま
+ * だと最後に余計な空ノードができるため)。途中の空行は元の構造として残す。
+ */
+export function splitPastedLines(text: string): string[] {
+  const trimmed = text.replace(/(\r\n|\r|\n)+$/, "");
+  return trimmed.split(/\r\n|\r|\n/);
+}
+
 const URL_PATTERN = /https?:\/\/[^\s<>"'　]+/g;
 
 /** テキスト中のURLを自動でクリック可能なリンクに変える(既存のリンクの中は対象外) */

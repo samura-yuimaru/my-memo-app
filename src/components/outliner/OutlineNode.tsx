@@ -4,7 +4,7 @@ import { useRef } from "react";
 import clsx from "clsx";
 import { Trash2 } from "lucide-react";
 import { OUTLINER_CLIPBOARD_MIME, useOutlineStore } from "@/lib/store/useOutlineStore";
-import { buildTree, countDescendants, flattenVisible } from "@/lib/utils/tree";
+import { buildPlainTextOutline, buildSelectedForest, countDescendants } from "@/lib/utils/tree";
 import { htmlToPlainText } from "@/lib/utils/richText";
 import { safeSetPointerCapture } from "@/lib/utils/dnd";
 import { writeToOsClipboard } from "@/lib/utils/clipboard";
@@ -28,19 +28,15 @@ const INDENT_WIDTH = 22;
  * コピー/カット/ペーストのUIポップアップは撤去済みのため、「選択が変わった瞬間に
  * その内容をOSクリップボードへ書き込む」ことで、選択そのものがコピー操作を兼ねる
  * ようにしている(ネイティブのテキスト選択+コピー吹き出しのような体験に近づける)。
- * プレーンテキストは階層のインデントまでは再現しない簡易版(改行区切りのみ)にとどめ、
+ * プレーンテキストは選択範囲だけを階層のインデントを保ったまま書き出す
+ * (buildSelectedForest + buildPlainTextOutline。キーボードのCtrl+Cと同じロジック)。
  * アプリ内貼り付けで使う階層構造付きのペイロードはstoreのbuildClipboardPayloadで
- * 正確に組み立てる(こちらは他アプリへ貼り付けた場合の可読性のための保険にすぎない)。
+ * 正確に組み立てる。
  */
 function copyTouchSelectionToClipboard(nodeIds: string[]): void {
   if (nodeIds.length === 0) return;
   const state = useOutlineStore.getState();
-  const flat = flattenVisible(buildTree(Object.values(state.nodes)));
-  const idSet = new Set(nodeIds);
-  const plainText = flat
-    .filter((n) => idSet.has(n.id))
-    .map((n) => htmlToPlainText(n.content))
-    .join("\n");
+  const plainText = buildPlainTextOutline(buildSelectedForest(Object.values(state.nodes), nodeIds));
   const payload = state.buildClipboardPayload(nodeIds);
   void writeToOsClipboard(plainText, payload, OUTLINER_CLIPBOARD_MIME);
 }
